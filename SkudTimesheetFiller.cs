@@ -223,6 +223,18 @@ public static class SkudExcelInteropFiller
                     continue;
 
                 var calc = dayEvents.Calculate();
+
+                if (calc.RequiresManualReview)
+                {
+                    dynamic reviewCell = sheet.Cells[employee.RowIndex, col];
+                    try { reviewCell.Interior.Color = RGB(255, 199, 206); } catch { }
+                    AddCommentSafe(reviewCell, calc.Status);
+                    protocol.Filling.Add(
+                        $"{employee.OriginalName}; {date:dd.MM.yyyy}; событий={calc.EventCount}; " +
+                        $"первое={FormatTime(calc.FirstEvent)}; последнее={FormatTime(calc.LastEvent)}; часы=; статус={calc.Status}");
+                    continue;
+                }
+
                 if (!calc.ShouldWriteValue || !calc.Hours.HasValue)
                     continue;
 
@@ -513,10 +525,20 @@ public static class SkudExcelInteropFiller
 
             if (uniqueKeys.Count == 1)
             {
+                string candidate = uniqueKeys[0];
+
+                if (!IsSafeShortKeyMatch(fioFromTimesheet, candidate))
+                {
+                    result.Status = PersonSearchResult.AmbiguousFound;
+                    result.StatusText = "сомнительное совпадение по краткому ключу";
+                    result.FoundVariants.Add($"{candidate}; причина=совпал только краткий ключ, но полные имена различаются");
+                    return result;
+                }
+
                 result.Status = PersonSearchResult.Found;
-                result.PersonKey = uniqueKeys[0];
+                result.PersonKey = candidate;
                 result.StatusText = "найден по краткому ключу";
-                result.FoundVariants.Add(uniqueKeys[0]);
+                result.FoundVariants.Add(candidate);
                 return result;
             }
 
@@ -529,6 +551,39 @@ public static class SkudExcelInteropFiller
         result.Status = PersonSearchResult.NotFound;
         result.StatusText = "не найден";
         return result;
+    }
+
+    private static bool IsSafeShortKeyMatch(string timesheetName, string skudName)
+    {
+        var timesheetParts = ParseFioParts(timesheetName);
+        var skudParts = ParseFioParts(skudName);
+
+        if (string.IsNullOrWhiteSpace(timesheetParts.Surname)
+            || string.IsNullOrWhiteSpace(timesheetParts.FirstName)
+            || string.IsNullOrWhiteSpace(skudParts.Surname)
+            || string.IsNullOrWhiteSpace(skudParts.FirstName))
+            return true;
+
+        if (!string.Equals(timesheetParts.Surname, skudParts.Surname, StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        bool timesheetHasFullFirstName = timesheetParts.FirstName.Length > 1;
+        bool skudHasFullFirstName = skudParts.FirstName.Length > 1;
+
+        if (timesheetHasFullFirstName && skudHasFullFirstName)
+            return string.Equals(timesheetParts.FirstName, skudParts.FirstName, StringComparison.OrdinalIgnoreCase);
+
+        return timesheetParts.FirstName[0] == skudParts.FirstName[0];
+    }
+
+    private static FioParts ParseFioParts(string fio)
+    {
+        var parts = NormalizeFio(fio).Split(' ', StringSplitOptions.RemoveEmptyEntries);
+
+        return new FioParts(
+            parts.Length > 0 ? parts[0] : string.Empty,
+            parts.Length > 1 ? parts[1] : string.Empty,
+            parts.Length > 2 ? parts[2] : string.Empty);
     }
 
     private static Dictionary<string, List<string>> BuildPersonKeyIndex(Dictionary<string, Dictionary<DateTime, DayEvents>> eventsByPerson)
@@ -991,7 +1046,18 @@ public static class SkudExcelInteropFiller
             }
 
             double totalHours = (result.LastEvent.Value - result.FirstEvent.Value).TotalHours;
-            result.Hours = Math.Round(totalHours, MidpointRounding.AwayFromZero);
+            double roundedHours = Math.Round(totalHours, MidpointRounding.AwayFromZero);
+
+            if (totalHours < 1 || roundedHours <= 0)
+            {
+                result.Hours = null;
+                result.ShouldWriteValue = false;
+                result.RequiresManualReview = true;
+                result.Status = "События есть, но интервал меньше 1 часа. Требуется ручная проверка.";
+                return result;
+            }
+
+            result.Hours = roundedHours;
             result.ShouldWriteValue = true;
             result.Status = "Рассчитано по первому и последнему событию дня.";
             return result;
@@ -1006,6 +1072,7 @@ public static class SkudExcelInteropFiller
         public DateTime? FirstEvent { get; set; }
         public DateTime? LastEvent { get; set; }
         public bool IsSingleAllowedEvent { get; set; }
+        public bool RequiresManualReview { get; set; }
         public string Status { get; set; } = string.Empty;
     }
 
@@ -1024,6 +1091,8 @@ public static class SkudExcelInteropFiller
         int UsedRows);
 
     private sealed record TimesheetEmployee(int RowIndex, string OriginalName);
+
+    private sealed record FioParts(string Surname, string FirstName, string Patronymic);
 
     private sealed class ProcessingProtocol
     {

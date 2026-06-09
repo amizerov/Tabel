@@ -242,6 +242,12 @@ public static class SkudTimesheetComparator
                 }
                 else if ((originalCell.IsNumber && filledCell.IsEmpty) || (originalCell.IsEmpty && filledCell.IsNumber))
                 {
+                    if ((originalCell.IsEmpty && filledCell.IsZero) || (filledCell.IsEmpty && originalCell.IsZero))
+                    {
+                        protocol.Add($"{originalEmployee.OriginalName};{day};Табель={FormatDisplay(originalCell)};СКУД={FormatDisplay(filledCell)};;Нет расхождения: пусто и 0 трактуются как отсутствие часов.");
+                        continue;
+                    }
+
                     stats.CheckedCells++;
                     stats.SignificantDifferences++;
                     double originalHours = originalCell.IsNumber ? originalCell.Value : 0;
@@ -529,6 +535,11 @@ public static class SkudTimesheetComparator
             return FormatNumber(cell.Value);
 
         return cell.Text;
+    }
+
+    private static bool IsZeroValue(double value)
+    {
+        return Math.Abs(value) < 0.000001;
     }
 
     private static string BuildShortNameKey(string fio)
@@ -821,6 +832,7 @@ public static class SkudTimesheetComparator
     {
         public bool IsEmpty { get; private init; }
         public bool IsNumber { get; private init; }
+        public bool IsZero => IsNumber && IsZeroValue(Value);
         public double Value { get; private init; }
         public string Text { get; private init; } = string.Empty;
 
