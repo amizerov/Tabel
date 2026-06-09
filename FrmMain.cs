@@ -4,6 +4,8 @@ public partial class FrmMain : Form
 {
     private string? _timesheetPath;
     private string? _skudPath;
+    private string? _lastFillerSummary;
+    private string? _lastComparatorSummary;
 
     public FrmMain()
     {
@@ -69,6 +71,8 @@ public partial class FrmMain : Form
 
         btnDoIt.Enabled = false;
         btnSelectTabel.Enabled = false;
+        btnSelectSkud.Enabled = false;
+        _lastFillerSummary = null;
 
         txtLog.Clear();
 
@@ -86,7 +90,7 @@ public partial class FrmMain : Form
             AddLog(result);
 
             MessageBox.Show(
-                "Табель успешно заполнен:" + Environment.NewLine + result,
+                (_lastFillerSummary ?? "Табель успешно заполнен.") + Environment.NewLine + result,
                 "Готово",
                 MessageBoxButtons.OK,
                 MessageBoxIcon.Information);
@@ -107,6 +111,7 @@ public partial class FrmMain : Form
         {
             btnDoIt.Enabled = true;
             btnSelectTabel.Enabled = true;
+            btnSelectSkud.Enabled = true;
         }
     }
 
@@ -131,6 +136,9 @@ public partial class FrmMain : Form
 
             btnDoIt.Enabled = false;
             btnSelectTabel.Enabled = false;
+            btnSelectSkud.Enabled = false;
+            btnCompare.Enabled = false;
+            _lastComparatorSummary = null;
 
             txtLog.Clear();
 
@@ -148,7 +156,7 @@ public partial class FrmMain : Form
                 AddLog(result);
 
                 MessageBox.Show(
-                    "Сравнение табелей завершено:" + Environment.NewLine + result,
+                    (_lastComparatorSummary ?? "Сравнение табелей завершено.") + Environment.NewLine + result,
                     "Готово",
                     MessageBoxButtons.OK,
                     MessageBoxIcon.Information);
@@ -169,6 +177,8 @@ public partial class FrmMain : Form
             {
                 btnDoIt.Enabled = true;
                 btnSelectTabel.Enabled = true;
+                btnSelectSkud.Enabled = true;
+                btnCompare.Enabled = true;
             }
         }
     }
@@ -187,6 +197,9 @@ public partial class FrmMain : Form
         }
 
         AddLog(text);
+
+        if (e.IsFinished)
+            _lastFillerSummary = e.Message;
     }
 
     private void SkudTimesheetComparator_ProgressChanged(object? sender, SkudProgressEventArgs e)
@@ -203,6 +216,9 @@ public partial class FrmMain : Form
         }
 
         AddLog(text);
+
+        if (e.IsFinished)
+            _lastComparatorSummary = e.Message;
     }
 
     private void AddLog(string text)

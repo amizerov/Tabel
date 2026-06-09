@@ -6,6 +6,7 @@ using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
@@ -17,11 +18,12 @@ internal enum PersonSearchResult
     AmbiguousFound
 }
 
-internal class PersonSearchInfo
+internal sealed class PersonSearchInfo
 {
     public PersonSearchResult Status { get; set; }
     public string? PersonKey { get; set; }
     public string SearchKey { get; set; } = string.Empty;
+    public string StatusText { get; set; } = string.Empty;
     public List<string> FoundVariants { get; set; } = new();
 }
 
@@ -36,31 +38,9 @@ public static class SkudExcelInteropFiller
 
     public static Task<string> FillTimesheetFromFolderAsync(string folderPath)
     {
-        return RunStaTask(() => FillTimesheetFromFolder(folderPath));
-    }
-
-    private static Task<T> RunStaTask<T>(Func<T> action)
-    {
-        var tcs = new TaskCompletionSource<T>();
-
-        var thread = new Thread(() =>
-        {
-            try
-            {
-                T result = action();
-                tcs.SetResult(result);
-            }
-            catch (Exception ex)
-            {
-                tcs.SetException(ex);
-            }
-        });
-
-        thread.IsBackground = true;
-        thread.SetApartmentState(ApartmentState.STA);
-        thread.Start();
-
-        return tcs.Task;
+        string skudPath = Path.Combine(folderPath, "выгрузка_СКУД.xlsx");
+        string timesheetPath = Path.Combine(folderPath, "Табель_СКУД.xlsx");
+        return FillTimesheetAsync(timesheetPath, skudPath);
     }
 
     public static string FillTimesheetFile(string timesheetPath, string skudPath)
@@ -75,18 +55,28 @@ public static class SkudExcelInteropFiller
             Path.GetDirectoryName(timesheetPath) ?? "",
             Path.GetFileNameWithoutExtension(timesheetPath) + "_заполнен.xlsx");
 
-        Type? excelType = Type.GetTypeFromProgID("Excel.Application");
+        string protocolPath = Path.Combine(
+            Path.GetDirectoryName(timesheetPath) ?? "",
+            Path.GetFileNameWithoutExtension(timesheetPath) + "_протокол.txt");
 
+        Type? excelType = Type.GetTypeFromProgID("Excel.Application");
         if (excelType == null)
             throw new Exception("Microsoft Excel не установлен или COM-объект Excel.Application недоступен.");
 
+        var protocol = new ProcessingProtocol();
         dynamic? excel = null;
         dynamic? skudBook = null;
-        dynamic? timesheetBook = null;
+        dynamic? outputBook = null;
 
         try
         {
             Report("Запуск Excel", "Запускаю Microsoft Excel...", 0, 100, 5);
+
+            if (File.Exists(outputPath))
+                File.Delete(outputPath);
+
+            File.Copy(timesheetPath, outputPath, true);
+            protocol.General.Add($"Создана копия исходного табеля: {outputPath}");
 
             excel = Activator.CreateInstance(excelType);
             excel.Visible = false;
@@ -100,69 +90,60 @@ public static class SkudExcelInteropFiller
             }
             catch { }
 
-            Report("Открытие выгрузки СКУД", "Открываю выгрузку СКУД...", 0, 100, 10);
-
+            Report("Чтение СКУД", "Ищу лист СКУД и читаю события...", 0, 100, 10);
             skudBook = excel.Workbooks.Open(skudPath);
-            dynamic skudSheet = skudBook.Worksheets[1];
-
-            var eventsByPerson = ReadSkudExportFast(skudSheet);
+            var skudRead = ReadSkudEvents(skudBook, skudPath, protocol);
 
             skudBook.Close(false);
             ReleaseComObject(skudBook);
             skudBook = null;
 
-            Report("Открытие табеля подрядчика", "Открываю табель подрядчика...", 0, 100, 45);
+            if (skudRead.EventsByPerson.Count == 0)
+                throw new Exception("В файле СКУД не найдено допустимых событий прохода.");
 
-            timesheetBook = excel.Workbooks.Open(timesheetPath);
-            dynamic timesheetSheet = timesheetBook.Worksheets[1];
+            Report("Открытие табеля", "Открываю копию табеля для заполнения...", 0, 100, 45);
+            outputBook = excel.Workbooks.Open(outputPath);
 
-            FillTimesheet(timesheetSheet, eventsByPerson);
+            var fillResult = FillTimesheet(outputBook, skudRead.EventsByPerson, skudRead.MainMonth, protocol);
 
             Report("Сохранение", "Сохраняю заполненный табель...", 0, 100, 95);
+            outputBook.Save();
+            outputBook.Close(false);
+            ReleaseComObject(outputBook);
+            outputBook = null;
 
-            if (File.Exists(outputPath))
-                File.Delete(outputPath);
+            WriteProtocol(protocolPath, protocol);
 
-            timesheetBook.SaveAs(outputPath);
+            string summary =
+                $"Обработка завершена. Сотрудников в табеле: {fillResult.TotalEmployees}. " +
+                $"Сопоставлено со СКУД: {fillResult.MatchedEmployees}. Не найдено: {fillResult.NotFoundEmployees}. " +
+                $"Неоднозначно: {fillResult.AmbiguousEmployees}. Заполнено ячеек: {fillResult.FilledCells}. " +
+                $"Ошибок: {protocol.Errors.Count}. Файл: {outputPath}";
 
-            timesheetBook.Close(false);
-            ReleaseComObject(timesheetBook);
-            timesheetBook = null;
-
-            Report("Готово", "Табель успешно заполнен.", 100, 100, 100, true);
-
+            Report("Готово", summary, 100, 100, 100, true);
             return outputPath;
+        }
+        catch (Exception ex)
+        {
+            protocol.Errors.Add($"Критическая ошибка; {ex.Message}");
+            try { WriteProtocol(protocolPath, protocol); } catch { }
+            Report("ОШИБКА", ex.Message, 0, 100, 100, true);
+            throw;
         }
         finally
         {
-            try
-            {
-                if (skudBook != null)
-                    skudBook.Close(false);
-            }
-            catch { }
-
-            try
-            {
-                if (timesheetBook != null)
-                    timesheetBook.Close(false);
-            }
-            catch { }
+            try { if (skudBook != null) skudBook.Close(false); } catch { }
+            try { if (outputBook != null) outputBook.Close(false); } catch { }
 
             if (skudBook != null)
                 ReleaseComObject(skudBook);
 
-            if (timesheetBook != null)
-                ReleaseComObject(timesheetBook);
+            if (outputBook != null)
+                ReleaseComObject(outputBook);
 
             if (excel != null)
             {
-                try
-                {
-                    excel.Quit();
-                }
-                catch { }
-
+                try { excel.Quit(); } catch { }
                 ReleaseComObject(excel);
             }
 
@@ -173,310 +154,339 @@ public static class SkudExcelInteropFiller
         }
     }
 
-    public static string FillTimesheetFromFolder(string folderPath)
+    private static Task<T> RunStaTask<T>(Func<T> action)
     {
-        string exportPath = Path.Combine(folderPath, "выгрузка_СКУД.xlsx");
-        string timesheetPath = Path.Combine(folderPath, "Табель_СКУД.xlsx");
-        string outputPath = Path.Combine(folderPath, "Табель_СКУД_заполнен.xlsx");
-
-        Report("Проверка файлов", "Проверяю наличие файлов...", 0, 100, 0);
-
-        if (!File.Exists(exportPath))
-            throw new FileNotFoundException("Не найден файл выгрузка_СКУД.xlsx", exportPath);
-
-        if (!File.Exists(timesheetPath))
-            throw new FileNotFoundException("Не найден файл Табель_СКУД.xlsx", timesheetPath);
-
-        Type? excelType = Type.GetTypeFromProgID("Excel.Application");
-
-        if (excelType == null)
-            throw new Exception("Microsoft Excel не установлен или COM-объект Excel.Application недоступен.");
-
-        dynamic? excel = null;
-        dynamic? exportBook = null;
-        dynamic? timesheetBook = null;
-
-        try
+        var tcs = new TaskCompletionSource<T>();
+        var thread = new Thread(() =>
         {
-            Report("Запуск Excel", "Запускаю Microsoft Excel...", 0, 100, 5);
+            try { tcs.SetResult(action()); }
+            catch (Exception ex) { tcs.SetException(ex); }
+        });
 
-            excel = Activator.CreateInstance(excelType);
-            excel.Visible = false;
-            excel.DisplayAlerts = false;
-
-            try
-            {
-                excel.ScreenUpdating = false;
-                excel.EnableEvents = false;
-                excel.Calculation = -4135;
-            }
-            catch
-            {
-            }
-
-            Report("Открытие выгрузки", "Открываю файл выгрузка_СКУД.xlsx...", 0, 100, 10);
-
-            exportBook = excel.Workbooks.Open(exportPath);
-            dynamic exportSheet = exportBook.Worksheets[1];
-
-            var eventsByPerson = ReadSkudExportFast(exportSheet);
-
-            exportBook.Close(false);
-            ReleaseComObject(exportBook);
-            exportBook = null;
-
-            Report("Открытие табеля", "Открываю файл Табель_СКУД.xlsx...", 0, 100, 45);
-
-            timesheetBook = excel.Workbooks.Open(timesheetPath);
-            dynamic timesheetSheet = timesheetBook.Worksheets[1];
-
-            FillTimesheet(timesheetSheet, eventsByPerson);
-
-            Report("Сохранение", "Сохраняю заполненный табель...", 0, 100, 95);
-
-            if (File.Exists(outputPath))
-                File.Delete(outputPath);
-
-            timesheetBook.SaveAs(outputPath);
-
-            timesheetBook.Close(false);
-            ReleaseComObject(timesheetBook);
-            timesheetBook = null;
-
-            Report("Готово", "Табель успешно заполнен.", 100, 100, 100, true);
-
-            return outputPath;
-        }
-        finally
-        {
-            try
-            {
-                if (exportBook != null)
-                    exportBook.Close(false);
-            }
-            catch { }
-
-            try
-            {
-                if (timesheetBook != null)
-                    timesheetBook.Close(false);
-            }
-            catch { }
-
-            if (exportBook != null)
-                ReleaseComObject(exportBook);
-
-            if (timesheetBook != null)
-                ReleaseComObject(timesheetBook);
-
-            if (excel != null)
-            {
-                try
-                {
-                    excel.Quit();
-                }
-                catch { }
-
-                ReleaseComObject(excel);
-            }
-
-            GC.Collect();
-            GC.WaitForPendingFinalizers();
-            GC.Collect();
-            GC.WaitForPendingFinalizers();
-        }
+        thread.IsBackground = true;
+        thread.SetApartmentState(ApartmentState.STA);
+        thread.Start();
+        return tcs.Task;
     }
 
-    private static void FillTimesheet(
-        dynamic sheet,
-        Dictionary<string, Dictionary<DateTime, DayEvents>> eventsByPerson)
+    private static FillResult FillTimesheet(
+        dynamic workbook,
+        Dictionary<string, Dictionary<DateTime, DayEvents>> eventsByPerson,
+        DateTime month,
+        ProcessingProtocol protocol)
     {
-        Report("Анализ табеля", "Читаю табель в память...", 0, 100, 50);
+        dynamic sheet = FindTimesheetWorksheet(workbook, month, protocol, out TimesheetStructure structure);
 
-        dynamic usedRange = sheet.UsedRange;
-        int usedRows = usedRange.Rows.Count;
-        int usedCols = usedRange.Columns.Count;
+        Report("Анализ табеля", $"Лист табеля найден. Строка дат: {structure.DateRow}, колонка ФИО: {ColumnName(structure.FioCol)}.", 0, 100, 50);
 
-        object[,] values = (object[,])usedRange.Value2;
-
-        int fioHeaderRow = -1;
-        int fioCol = -1;
-
-        Report("Анализ табеля", "Ищу колонку ФИО и колонки дней месяца...", 0, 100, 50);
-
-        // Поиск заголовка ФИО
-        for (int row = 1; row <= Math.Min(50, usedRows); row++)
-        {
-            for (int col = 1; col <= usedCols; col++)
-            {
-                string text = GetValueText(values[row, col]);
-
-                if (NormalizeHeader(text) == "фио")
-                {
-                    fioHeaderRow = row;
-                    fioCol = col;
-                    break;
-                }
-            }
-
-            if (fioHeaderRow > 0)
-                break;
-        }
-
-        if (fioHeaderRow < 0 || fioCol < 0)
-            throw new Exception("В табеле не найдена колонка 'ФИО'.");
-
-        var dayColumns = FindDayColumns(sheet, fioHeaderRow, usedCols);
-
-        if (dayColumns.Count == 0)
-            throw new Exception("В табеле не найдены колонки дней месяца: 1, 2, 3 ...");
-
-        DateTime monthDate = GetMainMonth(eventsByPerson);
-        int year = monthDate.Year;
-        int month = monthDate.Month;
-        int daysInMonth = DateTime.DaysInMonth(year, month);
-
-        Report(
-            "Анализ табеля",
-            $"Месяц выгрузки определен как {month:00}.{year}. Дней в месяце: {daysInMonth}.",
-            0,
-            100,
-            52);
-
-        // Сборка списка ФИО из табеля за один проход через массив
         var personKeyIndex = BuildPersonKeyIndex(eventsByPerson);
-        var peopleFromTimesheet = new List<(int row, string fio)>();
+        var employees = ReadTimesheetEmployees(structure, protocol);
+        var result = new FillResult { TotalEmployees = employees.Count };
 
-        for (int row = fioHeaderRow + 1; row <= usedRows; row++)
+        int daysInMonth = DateTime.DaysInMonth(month.Year, month.Month);
+
+        Report("Заполнение табеля", $"В табеле найдено сотрудников: {employees.Count}.", 0, employees.Count, 55);
+
+        for (int i = 0; i < employees.Count; i++)
         {
-            string fio = GetValueText(values[row, fioCol]);
+            var employee = employees[i];
+            var search = FindPersonInSkudData(employee.OriginalName, eventsByPerson, personKeyIndex);
 
-            if (!string.IsNullOrWhiteSpace(fio))
-                peopleFromTimesheet.Add((row, fio));
-        }
+            protocol.Matching.Add($"{employee.OriginalName}; ключ={search.SearchKey}; статус={search.StatusText}; варианты={string.Join(", ", search.FoundVariants)}");
 
-        int totalPeople = peopleFromTimesheet.Count;
-
-        Report(
-            "Заполнение табеля",
-            $"В табеле найдено сотрудников: {totalPeople}. Начинаю заполнять табель.",
-            0,
-            totalPeople,
-            55);
-
-        int filledCellsCount = 0;
-        var notFoundFios = new List<string>();
-        var ambiguousFios = new List<(string fio, List<string> variants)>();
-
-        for (int i = 0; i < peopleFromTimesheet.Count; i++)
-        {
-            var (row, fioFromTimesheet) = peopleFromTimesheet[i];
-
-            // Ищем ФИО в данных СКУД
-            var searchResult = FindPersonInSkudData(fioFromTimesheet, eventsByPerson, personKeyIndex);
-
-            if (searchResult.Status == PersonSearchResult.NotFound)
+            if (search.Status == PersonSearchResult.NotFound)
             {
-                notFoundFios.Add(fioFromTimesheet);
-                HighlightCellNotFound(sheet.Cells[row, fioCol], searchResult.SearchKey);
-                continue;
-            }
-            else if (searchResult.Status == PersonSearchResult.AmbiguousFound)
-            {
-                ambiguousFios.Add((fioFromTimesheet, searchResult.FoundVariants));
-                HighlightCellAmbiguous(sheet.Cells[row, fioCol], searchResult.SearchKey, searchResult.FoundVariants);
+                result.NotFoundEmployees++;
+                HighlightCellNotFound(sheet.Cells[employee.RowIndex, structure.FioCol], search.SearchKey);
                 continue;
             }
 
-            // Процесс заполнения часов
-            var personDays = eventsByPerson[searchResult.PersonKey!];
-
-            foreach (var pair in dayColumns)
+            if (search.Status == PersonSearchResult.AmbiguousFound)
             {
-                int day = pair.Key;
-                int col = pair.Value;
+                result.AmbiguousEmployees++;
+                HighlightCellAmbiguous(sheet.Cells[employee.RowIndex, structure.FioCol], search.SearchKey, search.FoundVariants);
+                continue;
+            }
 
-                if (day < 1 || day > daysInMonth)
+            result.MatchedEmployees++;
+            var personDays = eventsByPerson[search.PersonKey!];
+
+            foreach (var dateColumn in structure.DateColumns.OrderBy(x => x.Key))
+            {
+                DateTime date = dateColumn.Key.Date;
+                int col = dateColumn.Value;
+
+                if (date.Month != month.Month || date.Year != month.Year || date.Day > daysInMonth)
                     continue;
 
-                DateTime date = new DateTime(year, month, day);
-
-                dynamic cell = sheet.Cells[row, col];
-
-                // НЕ затирать значение заранее
                 if (!personDays.TryGetValue(date, out var dayEvents))
                     continue;
 
                 var calc = dayEvents.Calculate();
-
-                if (calc == null)
+                if (!calc.ShouldWriteValue || !calc.Hours.HasValue)
                     continue;
 
-                // Если есть проблемные события - выделяем красным и добавляем комментарий, не меняем значение
-                if (calc.HasProblemEvents)
-                {
-                    try
-                    {
-                        cell.Interior.Color = RGB(255, 150, 150);
-                    }
-                    catch { }
+                dynamic cell = sheet.Cells[employee.RowIndex, col];
+                cell.Value2 = calc.Hours.Value;
+                SetNumberFormatSafe(cell);
 
-                    try
-                    {
-                        AddCommentSafe(cell, string.Join("; ", calc.ProblemMessages));
-                    }
-                    catch { }
-
-                    // логируем
-                    // не менять значение ячейки
-                    continue;
-                }
-
-                // Если одна разрешенная отметка
                 if (calc.IsSingleAllowedEvent)
                 {
                     try { cell.Interior.Color = RGB(189, 215, 238); } catch { }
-                    try { AddCommentSafe(cell, calc.Comment ?? ""); } catch { }
-                    // Записать 2
-                    cell.Value2 = 2;
-                    SetNumberFormatSafe(cell);
-                    filledCellsCount++;
-                    continue;
+                    AddCommentSafe(cell, "Одна запись СКУД за день. Установлено 2 часа.");
                 }
 
-                if (calc.ShouldWriteValue && calc.Hours.HasValue)
-                {
-                    cell.Value2 = calc.Hours.Value;
-                    SetNumberFormatSafe(cell);
-                    filledCellsCount++;
-                }
-                else
-                {
-                    // не менять/очищать
-                }
+                result.FilledCells++;
+                protocol.Filling.Add(
+                    $"{employee.OriginalName}; {date:dd.MM.yyyy}; событий={calc.EventCount}; " +
+                    $"первое={FormatTime(calc.FirstEvent)}; последнее={FormatTime(calc.LastEvent)}; часы={calc.Hours}; статус={calc.Status}");
             }
 
-            int current = i + 1;
-            int percent = ScalePercent(current, totalPeople, 55, 90);
+            if (structure.TotalHoursCol.HasValue)
+                RecalculateTotal(sheet, employee.RowIndex, structure, protocol);
 
-            if (current % 5 == 0 || current == totalPeople)
+            int current = i + 1;
+            if (current % 5 == 0 || current == employees.Count)
+                Report("Заполнение табеля", $"Заполняю сотрудников: {current} из {employees.Count}", current, employees.Count, ScalePercent(current, employees.Count, 55, 90));
+        }
+
+        return result;
+    }
+
+    private static dynamic FindTimesheetWorksheet(dynamic workbook, DateTime month, ProcessingProtocol protocol, out TimesheetStructure structure)
+    {
+        int sheetsCount = workbook.Worksheets.Count;
+
+        for (int i = 1; i <= sheetsCount; i++)
+        {
+            dynamic sheet = workbook.Worksheets[i];
+
+            try
             {
-                Report(
-                    "Заполнение табеля",
-                    $"Заполняю сотрудников: {current} из {totalPeople}",
-                    current,
-                    totalPeople,
-                    percent);
+                dynamic usedRange = sheet.UsedRange;
+                object[,] values = ToArray2D(usedRange.Value2);
+                int usedRows = usedRange.Rows.Count;
+                int usedCols = usedRange.Columns.Count;
+
+                if (TryDetectTimesheetStructure(values, usedRows, usedCols, month, protocol, out structure))
+                    return sheet;
+            }
+            catch (Exception ex)
+            {
+                protocol.Errors.Add($"Табель; лист {i}; ошибка анализа структуры; {ex.Message}");
             }
         }
 
-        Report(
-            "Итог заполнения",
-            $"Сотрудников найдено в табеле: {totalPeople}. Заполнено ячеек с часами: {filledCellsCount}. " +
-            $"Не найдено в СКУД: {notFoundFios.Count}. Неоднозначных: {ambiguousFios.Count}.",
-            totalPeople,
-            totalPeople,
-            92);
+        throw new Exception("Не удалось определить лист табеля. Не найдены ФИО сотрудников или строка с датами.");
+    }
+
+    private static bool TryDetectTimesheetStructure(
+        object[,] values,
+        int usedRows,
+        int usedCols,
+        DateTime month,
+        ProcessingProtocol protocol,
+        out TimesheetStructure structure)
+    {
+        structure = default!;
+        int fioCol = FindFioColumn(values, usedRows, usedCols, out int headerRow);
+
+        if (fioCol < 0)
+        {
+            fioCol = 2;
+            headerRow = 0;
+        }
+
+        var dateColumns = new Dictionary<DateTime, int>();
+        int dateRow = -1;
+
+        for (int row = 1; row <= Math.Min(15, usedRows); row++)
+        {
+            var detected = ReadDateColumns(values, row, usedCols, month);
+            if (detected.Count >= 5)
+            {
+                dateColumns = detected;
+                dateRow = row;
+                break;
+            }
+        }
+
+        if (dateColumns.Count == 0 && usedRows >= 4 && usedCols >= 31)
+        {
+            dateRow = 4;
+            for (int col = 4; col <= Math.Min(31, usedCols); col++)
+            {
+                int day = col - 3;
+                if (day <= DateTime.DaysInMonth(month.Year, month.Month))
+                    dateColumns[new DateTime(month.Year, month.Month, day)] = col;
+            }
+
+            protocol.General.Add("Использован fallback структуры табеля: строка дат = 4, дневные столбцы = D:AE, итоговая колонка = AF.");
+        }
+
+        if (dateColumns.Count == 0)
+            return false;
+
+        if (!HasEmployeeLikeRows(values, usedRows, fioCol, Math.Max(headerRow, dateRow) + 1))
+            return false;
+
+        int? totalCol = FindTotalColumn(values, Math.Max(headerRow, dateRow), usedCols);
+        structure = new TimesheetStructure(
+            Math.Max(headerRow, dateRow),
+            dateRow,
+            Math.Max(headerRow, dateRow) + 1,
+            fioCol,
+            dateColumns,
+            totalCol ?? (usedCols >= 32 ? 32 : null),
+            values,
+            usedRows);
+
+        return true;
+    }
+
+    private static SkudReadResult ReadSkudEvents(dynamic workbook, string filePath, ProcessingProtocol protocol)
+    {
+        int sheetsCount = workbook.Worksheets.Count;
+        var result = new Dictionary<string, Dictionary<DateTime, DayEvents>>(StringComparer.OrdinalIgnoreCase);
+        var monthCounter = new Dictionary<(int Year, int Month), int>();
+
+        for (int sheetIndex = 1; sheetIndex <= sheetsCount; sheetIndex++)
+        {
+            dynamic sheet = workbook.Worksheets[sheetIndex];
+
+            try
+            {
+                dynamic usedRange = sheet.UsedRange;
+                object[,] values = ToArray2D(usedRange.Value2);
+                int usedRows = usedRange.Rows.Count;
+                int usedCols = usedRange.Columns.Count;
+
+                if (!TryFindSkudColumns(values, usedRows, usedCols, out int headerRow, out int dateCol, out int personCol, out int messageCol))
+                    continue;
+
+                protocol.General.Add($"Лист СКУД найден: {sheetIndex}. Строка заголовков: {headerRow}.");
+
+                for (int row = headerRow + 1; row <= usedRows; row++)
+                {
+                    string person = GetValueText(values[row, personCol]);
+                    string message = GetValueText(values[row, messageCol]);
+
+                    if (string.IsNullOrWhiteSpace(person))
+                        continue;
+
+                    if (!TryReadDateTimeFromValue(values[row, dateCol], out DateTime eventDateTime))
+                    {
+                        protocol.Errors.Add($"СКУД; {Path.GetFileName(filePath)}; лист {sheetIndex}; строка {row}; колонка {ColumnName(dateCol)}; не прочитана дата; {GetValueText(values[row, dateCol])}");
+                        continue;
+                    }
+
+                    if (!IsAllowedSkudMessage(message))
+                    {
+                        protocol.Errors.Add($"СКУД; {Path.GetFileName(filePath)}; лист {sheetIndex}; строка {row}; сообщение пропущено; {message}");
+                        continue;
+                    }
+
+                    string personKey = NormalizeFio(person);
+                    DateTime date = eventDateTime.Date;
+
+                    if (!result.TryGetValue(personKey, out var personDays))
+                    {
+                        personDays = new Dictionary<DateTime, DayEvents>();
+                        result[personKey] = personDays;
+                    }
+
+                    if (!personDays.TryGetValue(date, out var dayEvents))
+                    {
+                        dayEvents = new DayEvents();
+                        personDays[date] = dayEvents;
+                    }
+
+                    dayEvents.AddEvent(new SkudEvent
+                    {
+                        OriginalPerson = person,
+                        DateTime = eventDateTime,
+                        Message = message,
+                        SourceRowIndex = row
+                    });
+
+                    var monthKey = (eventDateTime.Year, eventDateTime.Month);
+                    monthCounter[monthKey] = monthCounter.TryGetValue(monthKey, out int count) ? count + 1 : 1;
+                }
+
+                if (result.Count > 0)
+                {
+                    var main = monthCounter.OrderByDescending(x => x.Value).First().Key;
+                    return new SkudReadResult(result, new DateTime(main.Year, main.Month, 1));
+                }
+            }
+            catch (Exception ex)
+            {
+                protocol.Errors.Add($"СКУД; {Path.GetFileName(filePath)}; лист {sheetIndex}; ошибка чтения; {ex.Message}");
+            }
+        }
+
+        throw new Exception("Не удалось найти лист СКУД. Не найдены обязательные колонки: Дата записи, Персона, Сообщение.");
+    }
+
+    private static bool TryFindSkudColumns(object[,] values, int usedRows, int usedCols, out int headerRow, out int dateCol, out int personCol, out int messageCol)
+    {
+        headerRow = -1;
+        dateCol = -1;
+        personCol = -1;
+        messageCol = -1;
+
+        for (int row = 1; row <= Math.Min(50, usedRows); row++)
+        {
+            int currentDateCol = -1;
+            int currentPersonCol = -1;
+            int currentMessageCol = -1;
+
+            for (int col = 1; col <= usedCols; col++)
+            {
+                string header = NormalizeHeader(GetValueText(values[row, col]));
+
+                if (header == "дата записи")
+                    currentDateCol = col;
+                else if (header == "персона")
+                    currentPersonCol = col;
+                else if (header == "сообщение" || header == "message")
+                    currentMessageCol = col;
+            }
+
+            if (currentDateCol > 0 && currentPersonCol > 0 && currentMessageCol > 0)
+            {
+                headerRow = row;
+                dateCol = currentDateCol;
+                personCol = currentPersonCol;
+                messageCol = currentMessageCol;
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static List<TimesheetEmployee> ReadTimesheetEmployees(TimesheetStructure structure, ProcessingProtocol protocol)
+    {
+        var result = new List<TimesheetEmployee>();
+
+        for (int row = structure.FirstEmployeeRow; row <= structure.UsedRows; row++)
+        {
+            string fio = GetValueText(structure.Values[row, structure.FioCol]);
+
+            if (string.IsNullOrWhiteSpace(fio))
+                continue;
+
+            if (!LooksLikePersonName(fio))
+                continue;
+
+            result.Add(new TimesheetEmployee(row, fio));
+        }
+
+        if (result.Count == 0)
+            protocol.Errors.Add("Табель; не найдены строки сотрудников в колонке ФИО.");
+
+        return result;
     }
 
     private static PersonSearchInfo FindPersonInSkudData(
@@ -484,61 +494,235 @@ public static class SkudExcelInteropFiller
         Dictionary<string, Dictionary<DateTime, DayEvents>> eventsByPerson,
         Dictionary<string, List<string>> personKeyIndex)
     {
-        var result = new PersonSearchInfo();
         string normalizedFio = NormalizeFio(fioFromTimesheet);
         string searchKey = BuildPersonSearchKey(fioFromTimesheet);
-        result.SearchKey = string.IsNullOrEmpty(searchKey) ? FirstWord(normalizedFio) : searchKey;
+        var result = new PersonSearchInfo { SearchKey = string.IsNullOrWhiteSpace(searchKey) ? FirstWord(normalizedFio) : searchKey };
 
-        // Шаг 1: точное совпадение полного ФИО
         if (!string.IsNullOrWhiteSpace(normalizedFio) && eventsByPerson.ContainsKey(normalizedFio))
         {
             result.Status = PersonSearchResult.Found;
             result.PersonKey = normalizedFio;
+            result.StatusText = "найден по полному ФИО";
+            result.FoundVariants.Add(normalizedFio);
             return result;
         }
 
-        // Шаг 2: поиск по ключу Фамилия + первая буква имени
         if (!string.IsNullOrWhiteSpace(searchKey) && personKeyIndex.TryGetValue(searchKey, out var keys))
         {
-            if (keys.Count == 1)
+            var uniqueKeys = keys.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+
+            if (uniqueKeys.Count == 1)
             {
                 result.Status = PersonSearchResult.Found;
-                result.PersonKey = keys[0];
+                result.PersonKey = uniqueKeys[0];
+                result.StatusText = "найден по краткому ключу";
+                result.FoundVariants.Add(uniqueKeys[0]);
                 return result;
             }
-            else if (keys.Count > 1)
-            {
-                // если среди вариантов есть точное совпадение по полному ФИО - используем его
-                if (!string.IsNullOrWhiteSpace(normalizedFio))
-                {
-                    var exact = keys.FirstOrDefault(k => string.Equals(k, normalizedFio, StringComparison.OrdinalIgnoreCase));
-                    if (exact != null)
-                    {
-                        result.Status = PersonSearchResult.Found;
-                        result.PersonKey = exact;
-                        return result;
-                    }
-                }
 
-                result.Status = PersonSearchResult.AmbiguousFound;
-                result.FoundVariants = keys.ToList();
-                return result;
-            }
+            result.Status = PersonSearchResult.AmbiguousFound;
+            result.StatusText = "неоднозначно";
+            result.FoundVariants = uniqueKeys;
+            return result;
         }
 
-        // Шаг 3: не найдено
         result.Status = PersonSearchResult.NotFound;
+        result.StatusText = "не найден";
         return result;
     }
 
-    private sealed class SkudEvent
+    private static Dictionary<string, List<string>> BuildPersonKeyIndex(Dictionary<string, Dictionary<DateTime, DayEvents>> eventsByPerson)
     {
-        public DateTime DateTime { get; set; }
-        public string Message { get; set; } = string.Empty;
-        public bool IsAllowedEnter { get; set; }
-        public bool IsAllowedExit { get; set; }
-        public bool IsAllowed => IsAllowedEnter || IsAllowedExit;
-        public bool IsProblem { get; set; }
+        var result = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (string fullFio in eventsByPerson.Keys)
+        {
+            string key = BuildPersonSearchKey(fullFio);
+
+            if (string.IsNullOrWhiteSpace(key))
+                continue;
+
+            if (!result.TryGetValue(key, out var list))
+            {
+                list = new List<string>();
+                result[key] = list;
+            }
+
+            list.Add(fullFio);
+        }
+
+        return result;
+    }
+
+    private static int FindFioColumn(object[,] values, int usedRows, int usedCols, out int headerRow)
+    {
+        headerRow = -1;
+
+        for (int row = 1; row <= Math.Min(50, usedRows); row++)
+        {
+            for (int col = 1; col <= usedCols; col++)
+            {
+                string header = NormalizeHeader(GetValueText(values[row, col]));
+
+                if (header == "фио" || header.Contains("фамилия"))
+                {
+                    headerRow = row;
+                    return col;
+                }
+            }
+        }
+
+        return -1;
+    }
+
+    private static Dictionary<DateTime, int> ReadDateColumns(object[,] values, int row, int usedCols, DateTime month)
+    {
+        var result = new Dictionary<DateTime, int>();
+
+        for (int col = 1; col <= usedCols; col++)
+        {
+            if (TryReadDayHeader(values[row, col], month, out DateTime date))
+                result[date.Date] = col;
+        }
+
+        return result;
+    }
+
+    private static bool TryReadDayHeader(object value, DateTime month, out DateTime date)
+    {
+        date = default;
+
+        if (value == null)
+            return false;
+
+        if (value is double d)
+        {
+            if (d >= 1 && d <= 31 && Math.Abs(d - Math.Round(d)) < 0.001)
+            {
+                int day = (int)Math.Round(d);
+                if (day <= DateTime.DaysInMonth(month.Year, month.Month))
+                {
+                    date = new DateTime(month.Year, month.Month, day);
+                    return true;
+                }
+            }
+
+            try
+            {
+                var excelDate = DateTime.FromOADate(d);
+                if (excelDate.Year > 1900)
+                {
+                    date = excelDate.Date;
+                    return true;
+                }
+            }
+            catch { }
+        }
+
+        string text = GetValueText(value);
+        if (int.TryParse(text, out int intDay) && intDay >= 1 && intDay <= DateTime.DaysInMonth(month.Year, month.Month))
+        {
+            date = new DateTime(month.Year, month.Month, intDay);
+            return true;
+        }
+
+        if (DateTime.TryParse(text, CultureInfo.GetCultureInfo("ru-RU"), DateTimeStyles.None, out DateTime parsed))
+        {
+            date = parsed.Date;
+            return true;
+        }
+
+        return false;
+    }
+
+    private static bool HasEmployeeLikeRows(object[,] values, int usedRows, int fioCol, int firstRow)
+    {
+        int found = 0;
+
+        for (int row = Math.Max(1, firstRow); row <= Math.Min(usedRows, firstRow + 80); row++)
+        {
+            if (LooksLikePersonName(GetValueText(values[row, fioCol])))
+                found++;
+
+            if (found >= 1)
+                return true;
+        }
+
+        return false;
+    }
+
+    private static bool LooksLikePersonName(string value)
+    {
+        string normalized = NormalizeFio(value);
+        if (string.IsNullOrWhiteSpace(normalized))
+            return false;
+
+        if (normalized.Contains("итого") || normalized.Contains("всего") || normalized.Contains("табель") || normalized.Contains("фио"))
+            return false;
+
+        return normalized.Split(' ', StringSplitOptions.RemoveEmptyEntries).Length >= 2;
+    }
+
+    private static int? FindTotalColumn(object[,] values, int row, int usedCols)
+    {
+        if (row <= 0)
+            return usedCols >= 32 ? 32 : null;
+
+        for (int col = 1; col <= usedCols; col++)
+        {
+            string header = NormalizeHeader(GetValueText(values[row, col]));
+            if (header.Contains("итог"))
+                return col;
+        }
+
+        return usedCols >= 32 ? 32 : null;
+    }
+
+    private static void RecalculateTotal(dynamic sheet, int row, TimesheetStructure structure, ProcessingProtocol protocol)
+    {
+        try
+        {
+            double total = 0;
+
+            foreach (int col in structure.DateColumns.Values.Distinct())
+            {
+                object value = sheet.Cells[row, col].Value2;
+                if (TryConvertToDouble(value, out double hours))
+                    total += hours;
+            }
+
+            dynamic totalCell = sheet.Cells[row, structure.TotalHoursCol!.Value];
+
+            try
+            {
+                if (totalCell.HasFormula == true)
+                    return;
+            }
+            catch { }
+
+            totalCell.Value2 = total;
+            SetNumberFormatSafe(totalCell);
+        }
+        catch (Exception ex)
+        {
+            protocol.Errors.Add($"Табель; строка {row}; не удалось пересчитать итоговую колонку; {ex.Message}");
+        }
+    }
+
+    private static bool IsAllowedSkudMessage(string message)
+    {
+        string text = NormalizeMessage(message);
+
+        if (string.IsNullOrWhiteSpace(text))
+            return false;
+
+        if (text.Contains("запрещ") || text.Contains("заблок") || text.Contains("несоглас") || text.Contains("несовпад"))
+            return false;
+
+        return text.Contains("вход")
+            || text.Contains("выход")
+            || text.Contains("проход разреш")
+            || text.Contains("доступ разреш");
     }
 
     private static string NormalizeMessage(string text)
@@ -546,387 +730,47 @@ public static class SkudExcelInteropFiller
         if (text == null)
             return string.Empty;
 
-        string t = text.Replace('\u00A0', ' ').Trim().ToLowerInvariant().Replace('ё','е');
-        t = Regex.Replace(t, @"\s+", " ");
-        return t;
+        text = text.Replace('\u00A0', ' ').Trim().ToLowerInvariant().Replace('ё', 'е');
+        return Regex.Replace(text, @"\s+", " ");
     }
 
-    private static Dictionary<string, Dictionary<DateTime, DayEvents>> ReadSkudExportFast(dynamic workbook)
+    private static string NormalizeFio(string text)
     {
-        Report("Чтение выгрузки", "Ищу лист с необходимыми колонками и читаю данные...", 0, 100, 12);
+        if (text == null)
+            return string.Empty;
 
-        Type t = workbook.GetType();
-        int sheetsCount = workbook.Worksheets.Count;
-
-        Dictionary<string, Dictionary<DateTime, DayEvents>> result = new(StringComparer.OrdinalIgnoreCase);
-
-        for (int si = 1; si <= sheetsCount; si++)
-        {
-            try
-            {
-                dynamic sheet = workbook.Worksheets[si];
-                dynamic usedRange = sheet.UsedRange;
-                int usedRows = usedRange.Rows.Count;
-                int usedCols = usedRange.Columns.Count;
-                object[,] values = (object[,])usedRange.Value2;
-
-                // Найти колонки Date, Person, Message в первых 50 строк
-                int headerRow = -1;
-                int dateCol = -1;
-                int personCol = -1;
-                int messageCol = -1;
-
-                for (int row = 1; row <= Math.Min(50, usedRows); row++)
-                {
-                    for (int col = 1; col <= usedCols; col++)
-                    {
-                        string txt = GetValueText(values[row, col]);
-                        string n = NormalizeHeader(txt);
-
-                        if (n == "дата записи") dateCol = col;
-                        else if (n == "персона") personCol = col;
-                        else if (n == "сообщение" || n == "message") messageCol = col;
-
-                        if (dateCol > 0 && personCol > 0 && messageCol > 0)
-                        {
-                            headerRow = row;
-                            break;
-                        }
-                    }
-
-                    if (headerRow > 0) break;
-                }
-
-                if (headerRow <= 0 || dateCol <= 0 || personCol <= 0 || messageCol <= 0)
-                {
-                    // Этот лист не подходит
-                    continue;
-                }
-
-                Report("Чтение листа СКУД", $"Читаю лист {si} - строки: {usedRows}", 0, usedRows, 20);
-
-                for (int row = headerRow + 1; row <= usedRows; row++)
-                {
-                    try
-                    {
-                        object personObj = values[row, personCol];
-                        object dateObj = values[row, dateCol];
-                        object msgObj = values[row, messageCol];
-
-                        if (personObj == null || dateObj == null)
-                            continue;
-
-                        string person = GetValueText(personObj);
-                        if (string.IsNullOrWhiteSpace(person))
-                            continue;
-
-                        if (!TryReadDateTimeFromValue(dateObj, out DateTime eventDt))
-                            continue;
-
-                        string message = GetValueText(msgObj);
-                        string normMsg = NormalizeMessage(message);
-
-                        var ev = new SkudEvent { DateTime = eventDt, Message = message };
-
-                        // Классифицируем сообщение
-                        if (normMsg.Contains("вход разреш") || normMsg.Contains("вход разрешен") || normMsg.Contains("вход разрешён"))
-                            ev.IsAllowedEnter = true;
-                        else if (normMsg.Contains("выход разреш") || normMsg.Contains("выход разрешен") || normMsg.Contains("выход разрешён"))
-                            ev.IsAllowedExit = true;
-                        else if (normMsg.Contains("повторный вход запрещ") || normMsg.Contains("повторный выход запрещ") || normMsg.Contains("выход запрещ") || normMsg.StartsWith("запрещено") || normMsg.Contains("заблокирован") || normMsg.Contains("несогласован") || normMsg.Contains("несовпада"))
-                            ev.IsProblem = true;
-
-                        string personKey = NormalizeFio(person);
-                        DateTime date = eventDt.Date;
-
-                        if (!result.TryGetValue(personKey, out var personDays))
-                        {
-                            personDays = new Dictionary<DateTime, DayEvents>();
-                            result[personKey] = personDays;
-                        }
-
-                        if (!personDays.TryGetValue(date, out var dayEvents))
-                        {
-                            dayEvents = new DayEvents();
-                            personDays[date] = dayEvents;
-                        }
-
-                        dayEvents.AddEvent(ev);
-                    }
-                    catch { }
-                }
-
-                // Если дошли сюда и считали хотя бы что-то — считаем чтение успешным
-                if (result.Count > 0)
-                    return result;
-            }
-            catch { }
-        }
-
-        throw new Exception("В файле СКУД не найден лист с обязательными колонками: Дата записи, Персона, Сообщение");
+        text = text.Replace('\u00A0', ' ').ToLowerInvariant().Replace('ё', 'е');
+        text = Regex.Replace(text, @"[^\p{L}\s]", " ");
+        text = Regex.Replace(text, @"\s+", " ");
+        return text.Trim();
     }
 
-    private record TimesheetStructure(
-        int HeaderRow,
-        int DateRow,
-        int FirstEmployeeRow,
-        int FioCol,
-        Dictionary<DateTime,int> DateColumns,
-        Dictionary<int,int> DayNumberColumns,
-        int? TotalHoursCol
-    );
-
-    private static TimesheetStructure DetectTimesheetStructure(dynamic sheet, object[,] values, int usedRows, int usedCols, DateTime? fallbackMonth)
+    private static string NormalizeHeader(string text)
     {
-        // Ищем строку заголовков по ячейке с "ФИО"
-        int headerRow = -1;
-        int fioCol = -1;
+        if (text == null)
+            return string.Empty;
 
-        for (int row = 1; row <= Math.Min(15, usedRows); row++)
-        {
-            for (int col = 1; col <= usedCols; col++)
-            {
-                string text = GetValueText(values[row, col]);
-                if (NormalizeHeader(text) == "фио")
-                {
-                    headerRow = row;
-                    fioCol = col;
-                    break;
-                }
-            }
-
-            if (headerRow > 0)
-                break;
-        }
-
-        if (headerRow < 0 || fioCol < 0)
-            throw new Exception("Не найдена строка заголовков с колонкой 'ФИО' в табеле.");
-
-        // Ищем строку дат в пределах headerRow..headerRow+3
-        int dateRow = -1;
-        var dateColumns = new Dictionary<DateTime,int>();
-        var dayNumberColumns = new Dictionary<int,int>();
-
-        for (int row = headerRow; row <= Math.Min(headerRow + 3, usedRows); row++)
-        {
-            bool foundAny = false;
-
-            for (int col = 1; col <= usedCols; col++)
-            {
-                if (col == fioCol) continue;
-
-                object raw = values[row, col];
-
-                if (raw == null)
-                    continue;
-
-                // Если double - Excel serial date
-                if (raw is double d)
-                {
-                    try
-                    {
-                        DateTime dt = DateTime.FromOADate(d);
-                        foundAny = true;
-                        // сохраним предположительно - дата без года/месяца пока не известны
-                        dateColumns[dt.Date] = col;
-                    }
-                    catch { }
-                }
-                else
-                {
-                    string txt = GetValueText(raw);
-                    if (int.TryParse(txt, out int day) && day >=1 && day <=31)
-                    {
-                        foundAny = true;
-                        dayNumberColumns[day] = col;
-                    }
-                    else
-                    {
-                        // попробуем распарсить как дата
-                        if (DateTime.TryParse(txt, out DateTime dt2))
-                        {
-                            foundAny = true;
-                            dateColumns[dt2.Date] = col;
-                        }
-                    }
-                }
-            }
-
-            if (foundAny)
-            {
-                dateRow = row;
-                break;
-            }
-        }
-
-        if (dateRow < 0)
-            throw new Exception("Не найдена строка дат рядом с заголовком табеля.");
-
-        // Теперь попытка сопоставить dayNumberColumns с fallbackMonth
-        if (dateColumns.Count == 0 && dayNumberColumns.Count > 0)
-        {
-            if (fallbackMonth == null)
-                throw new Exception("В табеле найдены только номера дней без месяца. Нельзя однозначно определить месяц для дат.");
-
-            int year = fallbackMonth.Value.Year;
-            int month = fallbackMonth.Value.Month;
-
-            foreach (var kv in dayNumberColumns)
-            {
-                int day = kv.Key;
-                int col = kv.Value;
-                try
-                {
-                    var dt = new DateTime(year, month, day);
-                    dateColumns[dt] = col;
-                }
-                catch { }
-            }
-        }
-
-        // Определим первую строку сотрудников - строка после dateRow
-        int firstEmployeeRow = dateRow + 1;
-
-        // Попробуем найти колонку итого часов - ищем заголовок содержащий "итог" или "итого"
-        int? totalCol = null;
-        for (int col = 1; col <= usedCols; col++)
-        {
-            string h = GetValueText(values[headerRow, col]);
-            string nh = NormalizeHeader(h);
-            if (nh.Contains("итог") || nh.Contains("итого") || nh.Contains("итог часов"))
-            {
-                totalCol = col;
-                break;
-            }
-        }
-
-        return new TimesheetStructure(headerRow, dateRow, firstEmployeeRow, fioCol, dateColumns, dayNumberColumns, totalCol);
+        text = text.Replace('\u00A0', ' ').ToLowerInvariant().Replace('ё', 'е');
+        text = Regex.Replace(text, @"\s+", " ");
+        return text.Trim();
     }
 
-    private static Dictionary<int, int> FindDayColumns(dynamic sheet, int headerRow, int usedCols)
+    private static string BuildPersonSearchKey(string fio)
     {
-        var result = new Dictionary<int, int>();
+        string normalized = NormalizeFio(fio);
+        var parts = normalized.Split(' ', StringSplitOptions.RemoveEmptyEntries);
 
-        dynamic usedRange = sheet.UsedRange;
-        object[,] values = (object[,])usedRange.Value2;
+        if (parts.Length < 2)
+            return string.Empty;
 
-        for (int col = 1; col <= usedCols; col++)
-        {
-            string text = GetValueText(values[headerRow, col]);
-
-            if (int.TryParse(text, out int day))
-            {
-                if (day >= 1 && day <= 31)
-                    result[day] = col;
-            }
-        }
-
-        return result;
+        return parts[0] + " " + parts[1][0];
     }
 
-    private static DateTime GetMainMonth(Dictionary<string, Dictionary<DateTime, DayEvents>> eventsByPerson)
+    private static string FirstWord(string text)
     {
-        var counter = new Dictionary<(int Year, int Month), int>();
-
-        foreach (var person in eventsByPerson.Values)
-        {
-            foreach (var date in person.Keys)
-            {
-                var key = (date.Year, date.Month);
-
-                if (!counter.ContainsKey(key))
-                    counter[key] = 0;
-
-                counter[key]++;
-            }
-        }
-
-        var main = counter.OrderByDescending(x => x.Value).First().Key;
-
-        return new DateTime(main.Year, main.Month, 1);
-    }
-
-    private sealed class DayEvents
-    {
-        public List<SkudEvent> Events { get; } = new List<SkudEvent>();
-
-        public void AddEvent(SkudEvent ev)
-        {
-            Events.Add(ev);
-            Events.Sort((a,b) => a.DateTime.CompareTo(b.DateTime));
-        }
-
-        public DayCalculationResult Calculate()
-        {
-            var res = new DayCalculationResult();
-
-            if (Events == null || Events.Count == 0)
-            {
-                res.HasAllowedEvents = false;
-                res.ShouldWriteValue = false;
-                return res;
-            }
-
-            var allowed = Events.Where(e => e.IsAllowed).ToList();
-            var problems = Events.Where(e => e.IsProblem).ToList();
-
-            res.ProblemMessages = problems.Select(p => p.Message).ToList();
-            res.HasProblemEvents = problems.Count > 0;
-            res.HasAllowedEvents = allowed.Count > 0;
-
-            if (res.HasProblemEvents)
-            {
-                // при проблемных сообщениях не менять значение ячейки
-                res.ShouldWriteValue = false;
-                res.Comment = string.Join("; ", res.ProblemMessages);
-                return res;
-            }
-
-            if (!res.HasAllowedEvents)
-            {
-                res.ShouldWriteValue = false;
-                return res;
-            }
-
-            if (allowed.Count == 1)
-            {
-                res.IsSingleAllowedEvent = true;
-                res.Hours = 2;
-                res.ShouldWriteValue = true;
-                res.Comment = "За дату найдена только одна разрешенная отметка СКУД";
-                return res;
-            }
-
-            // 2 или более разрешенных - взять первый и последний
-            var first = allowed.First().DateTime;
-            var last = allowed.Last().DateTime;
-
-            double totalHours = (last - first).TotalHours - 1.0;
-            if (totalHours < 0)
-                totalHours = 0;
-
-            int hoursWhole = (int)Math.Floor(totalHours);
-            double minutes = (totalHours - hoursWhole) * 60.0;
-
-            if (minutes >= 40)
-                hoursWhole += 1;
-
-            res.Hours = hoursWhole;
-            res.ShouldWriteValue = true;
-
-            return res;
-        }
-    }
-
-    private class DayCalculationResult
-    {
-        public bool HasAllowedEvents { get; set; }
-        public bool HasProblemEvents { get; set; }
-        public bool ShouldWriteValue { get; set; }
-        public double? Hours { get; set; }
-        public bool IsSingleAllowedEvent { get; set; }
-        public List<string> ProblemMessages { get; set; } = new List<string>();
-        public string? Comment { get; set; }
+        text = NormalizeFio(text);
+        int spaceIndex = text.IndexOf(' ');
+        return spaceIndex < 0 ? text : text[..spaceIndex];
     }
 
     private static bool TryReadDateTimeFromValue(object value, out DateTime result)
@@ -951,12 +795,10 @@ public static class SkudExcelInteropFiller
             }
 
             string text = Convert.ToString(value)?.Trim() ?? "";
-
             if (string.IsNullOrWhiteSpace(text))
                 return false;
 
             var ru = CultureInfo.GetCultureInfo("ru-RU");
-
             string[] formats =
             {
                 "dd.MM.yyyy H:mm:ss",
@@ -969,10 +811,8 @@ public static class SkudExcelInteropFiller
                 "yyyy-MM-dd HH:mm"
             };
 
-            if (DateTime.TryParseExact(text, formats, ru, DateTimeStyles.None, out result))
-                return true;
-
-            return DateTime.TryParse(text, ru, DateTimeStyles.None, out result);
+            return DateTime.TryParseExact(text, formats, ru, DateTimeStyles.None, out result)
+                || DateTime.TryParse(text, ru, DateTimeStyles.None, out result);
         }
         catch
         {
@@ -980,254 +820,68 @@ public static class SkudExcelInteropFiller
         }
     }
 
-    private static bool TryReadDateTime(dynamic cell, out DateTime value)
+    private static bool TryConvertToDouble(object value, out double result)
     {
-        value = default;
+        result = 0;
 
-        try
-        {
-            object raw = cell.Value2;
-
-            if (raw == null)
-                return false;
-
-            if (raw is double d)
-            {
-                value = DateTime.FromOADate(d);
-                return true;
-            }
-
-            if (raw is DateTime dt)
-            {
-                value = dt;
-                return true;
-            }
-
-            string text = Convert.ToString(raw)?.Trim() ?? "";
-
-            if (string.IsNullOrWhiteSpace(text))
-                return false;
-
-            var ru = CultureInfo.GetCultureInfo("ru-RU");
-
-            string[] formats =
-            {
-                "dd.MM.yyyy H:mm:ss",
-                "dd.MM.yyyy HH:mm:ss",
-                "dd.MM.yyyy H:mm",
-                "dd.MM.yyyy HH:mm",
-                "yyyy-MM-dd H:mm:ss",
-                "yyyy-MM-dd HH:mm:ss",
-                "yyyy-MM-dd H:mm",
-                "yyyy-MM-dd HH:mm"
-            };
-
-            if (DateTime.TryParseExact(text, formats, ru, DateTimeStyles.None, out value))
-                return true;
-
-            return DateTime.TryParse(text, ru, DateTimeStyles.None, out value);
-        }
-        catch
-        {
+        if (value == null)
             return false;
+
+        if (value is double d)
+        {
+            result = d;
+            return true;
         }
+
+        string text = Convert.ToString(value)?.Trim() ?? "";
+        return double.TryParse(text, NumberStyles.Any, CultureInfo.CurrentCulture, out result)
+            || double.TryParse(text, NumberStyles.Any, CultureInfo.InvariantCulture, out result);
     }
 
-    private static string GetCellText(dynamic cell)
+    private static object[,] ToArray2D(object value)
     {
-        try
-        {
-            object raw = cell.Value2;
+        if (value is object[,] array)
+            return array;
 
-            if (raw == null)
-                return "";
-
-            return Convert.ToString(raw)?.Trim() ?? "";
-        }
-        catch
-        {
-            return "";
-        }
+        var result = new object[2, 2];
+        result[1, 1] = value;
+        return result;
     }
 
     private static string GetValueText(object value)
     {
         try
         {
-            if (value == null)
-                return "";
-
-            return Convert.ToString(value)?.Trim() ?? "";
+            return value == null ? string.Empty : Convert.ToString(value)?.Trim() ?? string.Empty;
         }
         catch
         {
-            return "";
+            return string.Empty;
         }
-    }
-
-    private static string BuildPersonSearchKey(string fio)
-        {
-            if (string.IsNullOrWhiteSpace(fio))
-                return string.Empty;
-
-            string normalized = NormalizeFio(fio);
-            var parts = normalized.Split(' ', StringSplitOptions.RemoveEmptyEntries);
-
-            if (parts.Length < 2)
-                return string.Empty; // нельзя сформировать ключ
-
-            string surname = parts[0];
-            string firstInitial = parts[1].Substring(0, 1);
-
-            return surname + " " + firstInitial;
-        }
-
-        private static Dictionary<string, List<string>> BuildPersonKeyIndex(
-            Dictionary<string, Dictionary<DateTime, DayEvents>> eventsByPerson)
-        {
-            var result = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
-
-            foreach (string fullFio in eventsByPerson.Keys)
-            {
-                string key = BuildPersonSearchKey(fullFio);
-
-                if (string.IsNullOrWhiteSpace(key))
-                    continue;
-
-                if (!result.TryGetValue(key, out var list))
-                {
-                    list = new List<string>();
-                    result[key] = list;
-                }
-
-                list.Add(fullFio);
-            }
-
-            return result;
-        }
-
-    private static string FirstWord(string text)
-    {
-        text = NormalizeFio(text);
-
-        if (string.IsNullOrWhiteSpace(text))
-            return "";
-
-        int spaceIndex = text.IndexOf(' ');
-
-        if (spaceIndex < 0)
-            return text;
-
-        return text.Substring(0, spaceIndex);
-    }
-
-    private static string NormalizeFio(string text)
-    {
-        return NormalizeSpaces(text)
-            .ToLowerInvariant()
-            .Replace('ё', 'е');
-    }
-
-    private static string NormalizeHeader(string text)
-    {
-        return NormalizeSpaces(text)
-            .ToLowerInvariant()
-            .Replace('ё', 'е');
-    }
-
-    private static string NormalizeSpaces(string text)
-    {
-        if (text == null)
-            return "";
-
-        text = text.Replace('\u00A0', ' ');
-        text = Regex.Replace(text, @"\s+", " ");
-
-        return text.Trim();
-    }
-
-    private static int ScalePercent(int current, int total, int fromPercent, int toPercent)
-    {
-        if (total <= 0)
-            return fromPercent;
-
-        double k = (double)current / total;
-
-        if (k < 0)
-            k = 0;
-
-        if (k > 1)
-            k = 1;
-
-        return fromPercent + (int)Math.Round((toPercent - fromPercent) * k);
     }
 
     private static void SetNumberFormatSafe(dynamic cell)
     {
-        try
-        {
-            cell.NumberFormatLocal = "0";
-            return;
-        }
-        catch
-        {
-        }
-
-        try
-        {
-            cell.NumberFormat = "0";
-            return;
-        }
-        catch
-        {
-        }
+        try { cell.NumberFormatLocal = "0"; return; } catch { }
+        try { cell.NumberFormat = "0"; } catch { }
     }
 
     private static void HighlightCellNotFound(dynamic cell, string searchKey)
     {
-        try
-        {
-            // Светло-красный цвет (RGB: 255, 200, 200)
-            cell.Interior.Color = RGB(255, 200, 200);
-        }
-        catch { }
-
-        try
-        {
-            string comment = $"ФИО не найдено в выгрузке СКУД.\nКлюч поиска: {searchKey}";
-            cell.AddComment(comment);
-        }
-        catch { }
+        try { cell.Interior.Color = RGB(255, 200, 200); } catch { }
+        AddCommentSafe(cell, $"ФИО не найдено в выгрузке СКУД.\nКлюч поиска: {searchKey}");
     }
 
     private static void HighlightCellAmbiguous(dynamic cell, string searchKey, List<string> variants)
     {
-        try
-        {
-            // Оранжевый цвет (RGB: 255, 165, 0)
-            cell.Interior.Color = RGB(255, 165, 0);
-        }
-        catch { }
-
-        try
-        {
-            string variantsStr = string.Join(", ", variants);
-            string comment = $"Неоднозначное совпадение в СКУД.\nКлюч поиска: {searchKey}\nНайденные варианты: {variantsStr}";
-            cell.AddComment(comment);
-        }
-        catch { }
-    }
-
-    private static int RGB(int red, int green, int blue)
-    {
-        return red + (green << 8) + (blue << 16);
+        try { cell.Interior.Color = RGB(255, 165, 0); } catch { }
+        AddCommentSafe(cell, $"Неоднозначное сопоставление ФИО.\nКлюч поиска: {searchKey}\nНайденные варианты: {string.Join(", ", variants)}");
     }
 
     private static void AddCommentSafe(dynamic cell, string commentText)
     {
         try
         {
-            // удалить старый комментарий, если есть
             try { var old = cell.Comment; if (old != null) old.Delete(); } catch { }
             cell.AddComment(commentText);
             try { cell.Comment.Shape.TextFrame.AutoSize = true; } catch { }
@@ -1235,34 +889,156 @@ public static class SkudExcelInteropFiller
         catch { }
     }
 
-    private static void Report(
-        string stage,
-        string message,
-        int current,
-        int total,
-        int percent,
-        bool isFinished = false)
+    private static void WriteProtocol(string path, ProcessingProtocol protocol)
     {
-        ProgressChanged?.Invoke(
-            null,
-            new SkudProgressEventArgs(
-                stage,
-                message,
-                current,
-                total,
-                percent,
-                isFinished));
+        var sb = new StringBuilder();
+        AppendSection(sb, "Общее", protocol.General);
+        AppendSection(sb, "Протокол сопоставления", protocol.Matching);
+        AppendSection(sb, "Протокол заполнения", protocol.Filling);
+        AppendSection(sb, "Протокол ошибок", protocol.Errors);
+        File.WriteAllText(path, sb.ToString(), Encoding.UTF8);
+    }
+
+    private static void AppendSection(StringBuilder sb, string title, List<string> lines)
+    {
+        sb.AppendLine($"# {title}");
+        if (lines.Count == 0)
+            sb.AppendLine("Нет записей.");
+        else
+            foreach (string line in lines)
+                sb.AppendLine(line);
+
+        sb.AppendLine();
+    }
+
+    private static string FormatTime(DateTime? value)
+    {
+        return value.HasValue ? value.Value.ToString("HH:mm", CultureInfo.InvariantCulture) : "";
+    }
+
+    private static string ColumnName(int column)
+    {
+        string name = string.Empty;
+        while (column > 0)
+        {
+            int modulo = (column - 1) % 26;
+            name = Convert.ToChar('A' + modulo) + name;
+            column = (column - modulo) / 26;
+        }
+
+        return name;
+    }
+
+    private static int ScalePercent(int current, int total, int fromPercent, int toPercent)
+    {
+        if (total <= 0)
+            return fromPercent;
+
+        double k = Math.Clamp((double)current / total, 0, 1);
+        return fromPercent + (int)Math.Round((toPercent - fromPercent) * k);
+    }
+
+    private static int RGB(int red, int green, int blue)
+    {
+        return red + (green << 8) + (blue << 16);
+    }
+
+    private static void Report(string stage, string message, int current, int total, int percent, bool isFinished = false)
+    {
+        ProgressChanged?.Invoke(null, new SkudProgressEventArgs(stage, message, current, total, percent, isFinished));
     }
 
     private static void ReleaseComObject(object obj)
     {
-        try
+        try { Marshal.FinalReleaseComObject(obj); } catch { }
+    }
+
+    private sealed class SkudEvent
+    {
+        public string OriginalPerson { get; set; } = string.Empty;
+        public DateTime DateTime { get; set; }
+        public string Message { get; set; } = string.Empty;
+        public int SourceRowIndex { get; set; }
+    }
+
+    private sealed class DayEvents
+    {
+        private readonly List<SkudEvent> _events = new();
+
+        public void AddEvent(SkudEvent ev)
         {
-            Marshal.FinalReleaseComObject(obj);
+            _events.Add(ev);
+            _events.Sort((a, b) => a.DateTime.CompareTo(b.DateTime));
         }
-        catch
+
+        public DayCalculationResult Calculate()
         {
-            // COM-объект уже мог быть освобожден.
+            var result = new DayCalculationResult { EventCount = _events.Count };
+
+            if (_events.Count == 0)
+                return result;
+
+            result.FirstEvent = _events.First().DateTime;
+            result.LastEvent = _events.Last().DateTime;
+
+            if (_events.Count == 1)
+            {
+                result.Hours = 2;
+                result.ShouldWriteValue = true;
+                result.IsSingleAllowedEvent = true;
+                result.Status = "Одна запись СКУД за день. Установлено 2 часа.";
+                return result;
+            }
+
+            double totalHours = (result.LastEvent.Value - result.FirstEvent.Value).TotalHours;
+            result.Hours = Math.Round(totalHours, MidpointRounding.AwayFromZero);
+            result.ShouldWriteValue = true;
+            result.Status = "Рассчитано по первому и последнему событию дня.";
+            return result;
         }
+    }
+
+    private sealed class DayCalculationResult
+    {
+        public bool ShouldWriteValue { get; set; }
+        public double? Hours { get; set; }
+        public int EventCount { get; set; }
+        public DateTime? FirstEvent { get; set; }
+        public DateTime? LastEvent { get; set; }
+        public bool IsSingleAllowedEvent { get; set; }
+        public string Status { get; set; } = string.Empty;
+    }
+
+    private sealed record SkudReadResult(
+        Dictionary<string, Dictionary<DateTime, DayEvents>> EventsByPerson,
+        DateTime MainMonth);
+
+    private sealed record TimesheetStructure(
+        int HeaderRow,
+        int DateRow,
+        int FirstEmployeeRow,
+        int FioCol,
+        Dictionary<DateTime, int> DateColumns,
+        int? TotalHoursCol,
+        object[,] Values,
+        int UsedRows);
+
+    private sealed record TimesheetEmployee(int RowIndex, string OriginalName);
+
+    private sealed class ProcessingProtocol
+    {
+        public List<string> General { get; } = new();
+        public List<string> Matching { get; } = new();
+        public List<string> Filling { get; } = new();
+        public List<string> Errors { get; } = new();
+    }
+
+    private sealed class FillResult
+    {
+        public int TotalEmployees { get; set; }
+        public int MatchedEmployees { get; set; }
+        public int NotFoundEmployees { get; set; }
+        public int AmbiguousEmployees { get; set; }
+        public int FilledCells { get; set; }
     }
 }
