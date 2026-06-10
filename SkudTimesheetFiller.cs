@@ -36,13 +36,6 @@ public static class SkudExcelInteropFiller
         return RunStaTask(() => FillTimesheetFile(timesheetPath, skudPath));
     }
 
-    public static Task<string> FillTimesheetFromFolderAsync(string folderPath)
-    {
-        string skudPath = Path.Combine(folderPath, "выгрузка_СКУД.xlsx");
-        string timesheetPath = Path.Combine(folderPath, "Табель_СКУД.xlsx");
-        return FillTimesheetAsync(timesheetPath, skudPath);
-    }
-
     public static string FillTimesheetFile(string timesheetPath, string skudPath)
     {
         if (!File.Exists(timesheetPath))
@@ -104,7 +97,7 @@ public static class SkudExcelInteropFiller
             Report("Открытие табеля", "Открываю копию табеля для заполнения...", 0, 100, 45);
             outputBook = excel.Workbooks.Open(outputPath);
 
-            var fillResult = FillTimesheet(outputBook, skudRead.EventsByPerson, skudRead.MainMonth, protocol);
+            var fillResult = FillTimesheet(outputBook, skudRead.EventsByPerson, skudRead.MainMonth, skudRead.Months, protocol);
 
             Report("Сохранение", "Сохраняю заполненный табель...", 0, 100, 95);
             outputBook.Save();
@@ -173,9 +166,13 @@ public static class SkudExcelInteropFiller
         dynamic workbook,
         Dictionary<string, Dictionary<DateTime, DayEvents>> eventsByPerson,
         DateTime month,
+        IReadOnlyCollection<DateTime> skudMonths,
         ProcessingProtocol protocol)
     {
         dynamic sheet = FindTimesheetWorksheet(workbook, month, protocol, out TimesheetStructure structure);
+
+        if (skudMonths.Count > 1 && (structure.UsesSyntheticDayNumbers || HasOnlyDayNumberDateHeaders(structure)))
+            throw new Exception("В СКУД найдены записи за несколько месяцев, а в табеле даты указаны только номерами дней. Укажите в табеле полные даты или используйте выгрузку СКУД за один месяц.");
 
         Report("Анализ табеля", $"Лист табеля найден. Строка дат: {structure.DateRow}, колонка ФИО: {ColumnName(structure.FioCol)}.", 0, 100, 50);
 
@@ -210,6 +207,7 @@ public static class SkudExcelInteropFiller
 
             result.MatchedEmployees++;
             var personDays = eventsByPerson[search.PersonKey!];
+            var missingDates = new List<DateTime>();
 
             foreach (var dateColumn in structure.DateColumns.OrderBy(x => x.Key))
             {
@@ -219,8 +217,11 @@ public static class SkudExcelInteropFiller
                 if (date.Month != month.Month || date.Year != month.Year || date.Day > daysInMonth)
                     continue;
 
-                if (!personDays.TryGetValue(date, out var dayEvents))
+                if (!personDays.TryGetValue(date, out var dayEvents) || !dayEvents.HasAnyEvents)
+                {
+                    missingDates.Add(date);
                     continue;
+                }
 
                 var calc = dayEvents.Calculate();
 
@@ -252,6 +253,12 @@ public static class SkudExcelInteropFiller
                 protocol.Filling.Add(
                     $"{employee.OriginalName}; {date:dd.MM.yyyy}; событий={calc.EventCount}; " +
                     $"первое={FormatTime(calc.FirstEvent)}; последнее={FormatTime(calc.LastEvent)}; часы={calc.Hours}; статус={calc.Status}");
+            }
+
+            if (missingDates.Count > 0)
+            {
+                HighlightFioMissingDates(sheet.Cells[employee.RowIndex, structure.FioCol], missingDates, structure.DateColumns.Count);
+                protocol.Filling.Add($"{employee.OriginalName}; даты без записей СКУД={FormatDateList(missingDates)}; количество={missingDates.Count}");
             }
 
             if (structure.TotalHoursCol.HasValue)
@@ -304,13 +311,11 @@ public static class SkudExcelInteropFiller
         int fioCol = FindFioColumn(values, usedRows, usedCols, out int headerRow);
 
         if (fioCol < 0)
-        {
-            fioCol = 2;
-            headerRow = 0;
-        }
+            throw new Exception("Ошибка структуры табеля: не найдена колонка ФИО. Добавьте заголовок \"ФИО\" или \"Фамилия\".");
 
         var dateColumns = new Dictionary<DateTime, int>();
         int dateRow = -1;
+        bool usesSyntheticDayNumbers = false;
 
         for (int row = 1; row <= Math.Min(15, usedRows); row++)
         {
@@ -326,6 +331,7 @@ public static class SkudExcelInteropFiller
         if (dateColumns.Count == 0 && usedRows >= 4 && usedCols >= 31)
         {
             dateRow = 4;
+            usesSyntheticDayNumbers = true;
             for (int col = 4; col <= Math.Min(31, usedCols); col++)
             {
                 int day = col - 3;
@@ -351,7 +357,8 @@ public static class SkudExcelInteropFiller
             dateColumns,
             totalCol ?? (usedCols >= 32 ? 32 : null),
             values,
-            usedRows);
+            usedRows,
+            usesSyntheticDayNumbers);
 
         return true;
     }
@@ -392,7 +399,10 @@ public static class SkudExcelInteropFiller
                         continue;
                     }
 
-                    if (!IsAllowedSkudMessage(message))
+                    bool isAllowed = IsAllowedSkudMessage(message);
+                    bool isProblem = IsProblemSkudMessage(message);
+
+                    if (!isAllowed && !isProblem)
                     {
                         protocol.Errors.Add($"СКУД; {Path.GetFileName(filePath)}; лист {sheetIndex}; строка {row}; сообщение пропущено; {message}");
                         continue;
@@ -413,13 +423,18 @@ public static class SkudExcelInteropFiller
                         personDays[date] = dayEvents;
                     }
 
-                    dayEvents.AddEvent(new SkudEvent
+                    var skudEvent = new SkudEvent
                     {
                         OriginalPerson = person,
                         DateTime = eventDateTime,
                         Message = message,
                         SourceRowIndex = row
-                    });
+                    };
+
+                    if (isAllowed)
+                        dayEvents.AddAllowedEvent(skudEvent);
+                    else
+                        dayEvents.AddProblemEvent(skudEvent);
 
                     var monthKey = (eventDateTime.Year, eventDateTime.Month);
                     monthCounter[monthKey] = monthCounter.TryGetValue(monthKey, out int count) ? count + 1 : 1;
@@ -428,7 +443,12 @@ public static class SkudExcelInteropFiller
                 if (result.Count > 0)
                 {
                     var main = monthCounter.OrderByDescending(x => x.Value).First().Key;
-                    return new SkudReadResult(result, new DateTime(main.Year, main.Month, 1));
+                    var months = monthCounter.Keys
+                        .Select(x => new DateTime(x.Year, x.Month, 1))
+                        .OrderBy(x => x)
+                        .ToList();
+
+                    return new SkudReadResult(result, new DateTime(main.Year, main.Month, 1), months);
                 }
             }
             catch (Exception ex)
@@ -643,6 +663,34 @@ public static class SkudExcelInteropFiller
         return result;
     }
 
+    private static bool HasOnlyDayNumberDateHeaders(TimesheetStructure structure)
+    {
+        if (structure.DateColumns.Count == 0 || structure.DateRow <= 0)
+            return false;
+
+        foreach (int col in structure.DateColumns.Values.Distinct())
+        {
+            object value = structure.Values[structure.DateRow, col];
+
+            if (!IsDayNumberHeader(value))
+                return false;
+        }
+
+        return true;
+    }
+
+    private static bool IsDayNumberHeader(object value)
+    {
+        if (value == null)
+            return false;
+
+        if (value is double d)
+            return d >= 1 && d <= 31 && Math.Abs(d - Math.Round(d)) < 0.001;
+
+        string text = GetValueText(value);
+        return int.TryParse(text, out int day) && day >= 1 && day <= 31;
+    }
+
     private static bool TryReadDayHeader(object value, DateTime month, out DateTime date)
     {
         date = default;
@@ -774,10 +822,35 @@ public static class SkudExcelInteropFiller
         if (text.Contains("запрещ") || text.Contains("заблок") || text.Contains("несоглас") || text.Contains("несовпад"))
             return false;
 
-        return text.Contains("вход")
-            || text.Contains("выход")
-            || text.Contains("проход разреш")
-            || text.Contains("доступ разреш");
+        return text.Contains("вход разрешен")
+            || text.Contains("выход разрешен")
+            || text.Contains("проход разрешен")
+            || text.Contains("доступ разрешен");
+    }
+
+    private static bool IsProblemSkudMessage(string message)
+    {
+        string text = NormalizeMessage(message);
+
+        if (string.IsNullOrWhiteSpace(text))
+            return false;
+
+        return text.Contains("запрещ")
+            || text.Contains("заблок")
+            || text.Contains("несоглас")
+            || text.Contains("несовпад")
+            || text.Contains("повтор")
+            || text.Contains("ошиб")
+            || text.Contains("отказ")
+            || text.Contains("наруш")
+            || text.Contains("пропуск")
+            || text.Contains("заявк")
+            || text.Contains("служеб")
+            || text.Contains("неизвест")
+            || text.Contains("недейств")
+            || text.Contains("истек")
+            || text.Contains("аннулир")
+            || text.Contains("закрыт");
     }
 
     private static string NormalizeMessage(string text)
@@ -933,6 +1006,29 @@ public static class SkudExcelInteropFiller
         AddCommentSafe(cell, $"Неоднозначное сопоставление ФИО.\nКлюч поиска: {searchKey}\nНайденные варианты: {string.Join(", ", variants)}");
     }
 
+    private static void HighlightFioMissingDates(dynamic cell, List<DateTime> missingDates, int totalDateColumns)
+    {
+        try { cell.Interior.Color = RGB(189, 215, 238); } catch { }
+
+        string comment = missingDates.Count >= totalDateColumns
+            ? "По сотруднику нет записей СКУД за период табеля."
+            : $"По сотруднику есть даты без записей СКУД: {FormatDateList(missingDates)}.";
+
+        AddCommentSafe(cell, comment);
+    }
+
+    private static string FormatDateList(List<DateTime> dates)
+    {
+        const int maxDatesInComment = 20;
+        var ordered = dates.OrderBy(x => x).ToList();
+        string text = string.Join(", ", ordered.Take(maxDatesInComment).Select(x => x.ToString("dd.MM.yyyy", CultureInfo.InvariantCulture)));
+
+        if (ordered.Count > maxDatesInComment)
+            text += $" и еще {ordered.Count - maxDatesInComment}";
+
+        return text;
+    }
+
     private static void AddCommentSafe(dynamic cell, string commentText)
     {
         try
@@ -1018,25 +1114,49 @@ public static class SkudExcelInteropFiller
 
     private sealed class DayEvents
     {
-        private readonly List<SkudEvent> _events = new();
+        private readonly List<SkudEvent> _allowedEvents = new();
+        private readonly List<SkudEvent> _problemEvents = new();
 
-        public void AddEvent(SkudEvent ev)
+        public bool HasAnyEvents => _allowedEvents.Count > 0 || _problemEvents.Count > 0;
+
+        public void AddAllowedEvent(SkudEvent ev)
         {
-            _events.Add(ev);
-            _events.Sort((a, b) => a.DateTime.CompareTo(b.DateTime));
+            _allowedEvents.Add(ev);
+            _allowedEvents.Sort((a, b) => a.DateTime.CompareTo(b.DateTime));
+        }
+
+        public void AddProblemEvent(SkudEvent ev)
+        {
+            _problemEvents.Add(ev);
+            _problemEvents.Sort((a, b) => a.DateTime.CompareTo(b.DateTime));
         }
 
         public DayCalculationResult Calculate()
         {
-            var result = new DayCalculationResult { EventCount = _events.Count };
+            var result = new DayCalculationResult
+            {
+                EventCount = _allowedEvents.Count,
+                ProblemEventCount = _problemEvents.Count
+            };
 
-            if (_events.Count == 0)
+            if (_problemEvents.Count > 0)
+            {
+                result.RequiresManualReview = true;
+                result.ProblemMessages = _problemEvents
+                    .Select(x => $"{x.DateTime:HH:mm} {x.Message}")
+                    .Distinct()
+                    .ToList();
+                result.Status = "За дату есть проблемные сообщения СКУД. Значение табеля не изменено. " + string.Join("; ", result.ProblemMessages);
+                return result;
+            }
+
+            if (_allowedEvents.Count == 0)
                 return result;
 
-            result.FirstEvent = _events.First().DateTime;
-            result.LastEvent = _events.Last().DateTime;
+            result.FirstEvent = _allowedEvents.First().DateTime;
+            result.LastEvent = _allowedEvents.Last().DateTime;
 
-            if (_events.Count == 1)
+            if (_allowedEvents.Count == 1)
             {
                 result.Hours = 2;
                 result.ShouldWriteValue = true;
@@ -1065,16 +1185,19 @@ public static class SkudExcelInteropFiller
         public bool ShouldWriteValue { get; set; }
         public double? Hours { get; set; }
         public int EventCount { get; set; }
+        public int ProblemEventCount { get; set; }
         public DateTime? FirstEvent { get; set; }
         public DateTime? LastEvent { get; set; }
         public bool IsSingleAllowedEvent { get; set; }
         public bool RequiresManualReview { get; set; }
+        public List<string> ProblemMessages { get; set; } = new();
         public string Status { get; set; } = string.Empty;
     }
 
     private sealed record SkudReadResult(
         Dictionary<string, Dictionary<DateTime, DayEvents>> EventsByPerson,
-        DateTime MainMonth);
+        DateTime MainMonth,
+        IReadOnlyList<DateTime> Months);
 
     private sealed record TimesheetStructure(
         int HeaderRow,
@@ -1084,7 +1207,8 @@ public static class SkudExcelInteropFiller
         Dictionary<DateTime, int> DateColumns,
         int? TotalHoursCol,
         object[,] Values,
-        int UsedRows);
+        int UsedRows,
+        bool UsesSyntheticDayNumbers);
 
     private sealed record TimesheetEmployee(int RowIndex, string OriginalName);
 

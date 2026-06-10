@@ -242,21 +242,29 @@ public static class SkudTimesheetComparator
                 }
                 else if ((originalCell.IsNumber && filledCell.IsEmpty) || (originalCell.IsEmpty && filledCell.IsNumber))
                 {
-                    if ((originalCell.IsEmpty && filledCell.IsZero) || (filledCell.IsEmpty && originalCell.IsZero))
-                    {
-                        protocol.Add($"{originalEmployee.OriginalName};{day};Табель={FormatDisplay(originalCell)};СКУД={FormatDisplay(filledCell)};;Нет расхождения: пусто и 0 трактуются как отсутствие часов.");
-                        continue;
-                    }
-
                     stats.CheckedCells++;
-                    stats.SignificantDifferences++;
                     double originalHours = originalCell.IsNumber ? originalCell.Value : 0;
                     double filledHours = filledCell.IsNumber ? filledCell.Value : 0;
                     double difference = Math.Abs(filledHours - originalHours);
-                    HighlightCellYellow(outputSheet.Cells[filledEmployee.RowIndex, filledCol]);
+
+                    if (difference == 0)
+                        continue;
+
+                    string status = difference <= 1 ? "Допустимое расхождение" : "Существенное расхождение";
+
+                    if (difference <= 1)
+                    {
+                        stats.AllowedDifferences++;
+                        HighlightCellGreen(outputSheet.Cells[filledEmployee.RowIndex, filledCol]);
+                    }
+                    else
+                    {
+                        stats.SignificantDifferences++;
+                        HighlightCellYellow(outputSheet.Cells[filledEmployee.RowIndex, filledCol]);
+                    }
                     string comment = $"Разница: {FormatNumber(difference)} час. Табель: {FormatDisplay(originalCell)}. СКУД: {FormatDisplay(filledCell)}.";
                     AddCommentSafe(outputSheet.Cells[filledEmployee.RowIndex, filledCol], comment);
-                    protocol.Add($"{originalEmployee.OriginalName};{day};Табель={FormatDisplay(originalCell)};СКУД={FormatDisplay(filledCell)};Разница={FormatNumber(difference)};Существенное расхождение");
+                    protocol.Add($"{originalEmployee.OriginalName};{day};Табель={FormatDisplay(originalCell)};СКУД={FormatDisplay(filledCell)};Разница={FormatNumber(difference)};{status}");
                 }
                 else
                 {
@@ -331,11 +339,7 @@ public static class SkudTimesheetComparator
             catch { }
         }
 
-        dynamic fallbackSheet = workbook.Worksheets[1];
-        dynamic fallbackRange = fallbackSheet.UsedRange;
-        object[,] fallbackValues = ToArray2D(fallbackRange.Value2);
-        structure = BuildFallbackStructure(fallbackValues, fallbackRange.Rows.Count, fallbackRange.Columns.Count);
-        return fallbackSheet;
+        throw new Exception("Не удалось определить структуру табеля для сравнения. Не найдены колонка ФИО и строка с датами.");
     }
 
     private static bool TryDetectTimesheetStructure(object[,] values, int usedRows, int usedCols, out TimesheetStructure structure)
@@ -363,12 +367,8 @@ public static class SkudTimesheetComparator
 
         if (dayColumns.Count < 5)
         {
-            structure = BuildFallbackStructure(values, usedRows, usedCols);
-
-            if (structure.FioCol <= 0 || structure.DayColumns.Count == 0)
-                return false;
-
-            return true;
+            structure = default!;
+            return false;
         }
 
         structure = new TimesheetStructure(
@@ -383,28 +383,6 @@ public static class SkudTimesheetComparator
             usedCols);
 
         return true;
-    }
-
-    private static TimesheetStructure BuildFallbackStructure(object[,] values, int usedRows, int usedCols)
-    {
-        var dayColumns = new Dictionary<int, int>();
-
-        if (usedCols >= 4)
-        {
-            for (int col = 4; col <= Math.Min(31, usedCols); col++)
-                dayColumns[col - 3] = col;
-        }
-
-        return new TimesheetStructure(
-            HeaderRow: 4,
-            DateRow: 4,
-            FirstEmployeeRow: 5,
-            FioCol: usedCols >= 2 ? 2 : 1,
-            DayColumns: dayColumns,
-            TotalHoursCol: usedCols >= 32 ? 32 : null,
-            Values: values,
-            UsedRows: usedRows,
-            UsedCols: usedCols);
     }
 
     private static Dictionary<int, int> ReadDayColumns(object[,] values, int row, int usedCols)
