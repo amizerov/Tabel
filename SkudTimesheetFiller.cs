@@ -1045,17 +1045,13 @@ public static class SkudExcelInteropFiller
                 return result;
             }
 
-            double totalHours = (result.LastEvent.Value - result.FirstEvent.Value).TotalHours;
-            double roundedHours = Math.Round(totalHours, MidpointRounding.AwayFromZero);
+            TimeSpan duration = result.LastEvent.Value - result.FirstEvent.Value - TimeSpan.FromHours(1);
 
-            if (totalHours < 1 || roundedHours <= 0)
-            {
-                result.Hours = null;
-                result.ShouldWriteValue = false;
-                result.RequiresManualReview = true;
-                result.Status = "События есть, но интервал меньше 1 часа. Требуется ручная проверка.";
-                return result;
-            }
+            if (duration < TimeSpan.Zero)
+                duration = TimeSpan.Zero;
+
+            int wholeHours = (int)Math.Floor(duration.TotalHours);
+            int roundedHours = duration.Minutes >= 50 ? wholeHours + 1 : wholeHours;
 
             result.Hours = roundedHours;
             result.ShouldWriteValue = true;
