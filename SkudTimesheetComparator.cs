@@ -635,10 +635,22 @@ public static class SkudTimesheetComparator
         if (string.IsNullOrWhiteSpace(normalized))
             return false;
 
-        if (normalized.Contains("итого") || normalized.Contains("всего") || normalized.Contains("табель") || normalized.Contains("фио"))
+        var parts = normalized.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        if (parts.Length < 2)
             return false;
 
-        return normalized.Split(' ', StringSplitOptions.RemoveEmptyEntries).Length >= 2;
+        return !IsServiceRowText(normalized);
+    }
+
+    private static bool IsServiceRowText(string normalized)
+    {
+        return normalized == "фио"
+            || normalized == "итого"
+            || normalized == "всего"
+            || normalized.StartsWith("итого ")
+            || normalized.StartsWith("всего ")
+            || normalized.Contains("итого часов")
+            || normalized.Contains("сводный табель");
     }
 
     private static string NormalizeName(string text)
