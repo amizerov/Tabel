@@ -225,6 +225,13 @@ public static class SkudExcelInteropFiller
 
                 var calc = dayEvents.Calculate();
 
+                if (calc.ProblemEventCount > 0)
+                {
+                    protocol.Filling.Add(
+                        $"{employee.OriginalName}; {date:dd.MM.yyyy}; проблемных сообщений СКУД={calc.ProblemEventCount}; " +
+                        $"сообщения={string.Join("; ", calc.ProblemMessages)}");
+                }
+
                 if (calc.RequiresManualReview)
                 {
                     dynamic reviewCell = sheet.Cells[employee.RowIndex, col];
@@ -1148,22 +1155,20 @@ public static class SkudExcelInteropFiller
             var result = new DayCalculationResult
             {
                 EventCount = _allowedEvents.Count,
-                ProblemEventCount = _problemEvents.Count
-            };
-
-            if (_problemEvents.Count > 0)
-            {
-                result.RequiresManualReview = true;
-                result.ProblemMessages = _problemEvents
+                ProblemEventCount = _problemEvents.Count,
+                ProblemMessages = _problemEvents
                     .Select(x => $"{x.DateTime:HH:mm} {x.Message}")
                     .Distinct()
-                    .ToList();
-                result.Status = "За дату есть проблемные сообщения СКУД. Значение табеля не изменено. " + string.Join("; ", result.ProblemMessages);
-                return result;
-            }
+                    .ToList()
+            };
 
             if (_allowedEvents.Count == 0)
+            {
+                result.Status = _problemEvents.Count > 0
+                    ? "Нет разрешенных записей СКУД за день. Проблемные сообщения добавлены только в протокол."
+                    : string.Empty;
                 return result;
+            }
 
             result.FirstEvent = _allowedEvents.First().DateTime;
             result.LastEvent = _allowedEvents.Last().DateTime;
