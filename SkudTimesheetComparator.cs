@@ -245,26 +245,17 @@ public static class SkudTimesheetComparator
                     stats.CheckedCells++;
                     double originalHours = originalCell.IsNumber ? originalCell.Value : 0;
                     double filledHours = filledCell.IsNumber ? filledCell.Value : 0;
-                    double difference = Math.Abs(filledHours - originalHours);
 
-                    if (difference == 0)
-                        continue;
-
-                    string status = difference <= 1 ? "Допустимое расхождение" : "Существенное расхождение";
-
-                    if (difference <= 1)
-                    {
-                        stats.AllowedDifferences++;
-                        HighlightCellGreen(outputSheet.Cells[filledEmployee.RowIndex, filledCol]);
-                    }
-                    else
-                    {
-                        stats.SignificantDifferences++;
-                        HighlightCellYellow(outputSheet.Cells[filledEmployee.RowIndex, filledCol]);
-                    }
-                    string comment = $"Разница: {FormatNumber(difference)} час. Табель: {FormatDisplay(originalCell)}. СКУД: {FormatDisplay(filledCell)}.";
-                    AddCommentSafe(outputSheet.Cells[filledEmployee.RowIndex, filledCol], comment);
-                    protocol.Add($"{originalEmployee.OriginalName};{day};Табель={FormatDisplay(originalCell)};СКУД={FormatDisplay(filledCell)};Разница={FormatNumber(difference)};{status}");
+                    CompareNumericCells(
+                        outputSheet,
+                        filledEmployee.RowIndex,
+                        filledCol,
+                        originalEmployee.OriginalName,
+                        day,
+                        originalHours,
+                        filledHours,
+                        protocol,
+                        stats);
                 }
                 else
                 {
@@ -300,22 +291,26 @@ public static class SkudTimesheetComparator
         if (difference == 0)
             return;
 
-        string comment = $"Разница: {FormatNumber(difference)} час. Табель: {FormatNumber(originalHours)}. СКУД: {FormatNumber(filledHours)}.";
-
-        if (difference <= 1)
+        if (difference < 1)
         {
             stats.AllowedDifferences++;
             HighlightCellGreen(outputSheet.Cells[outputRow, outputCol]);
-            AddCommentSafe(outputSheet.Cells[outputRow, outputCol], comment);
             protocol.Add($"{fio};{day};Табель={originalHours};СКУД={filledHours};Разница={difference};Допустимое расхождение");
+            return;
         }
-        else
+
+        if (Math.Abs(difference - 1) < 0.000001)
         {
-            stats.SignificantDifferences++;
-            HighlightCellYellow(outputSheet.Cells[outputRow, outputCol]);
-            AddCommentSafe(outputSheet.Cells[outputRow, outputCol], comment);
-            protocol.Add($"{fio};{day};Табель={originalHours};СКУД={filledHours};Разница={difference};Существенное расхождение");
+            stats.AllowedDifferences++;
+            protocol.Add($"{fio};{day};Табель={originalHours};СКУД={filledHours};Разница={difference};Допустимое расхождение без выделения");
+            return;
         }
+
+        stats.SignificantDifferences++;
+        HighlightCellYellow(outputSheet.Cells[outputRow, outputCol]);
+        string comment = $"Исходный табель: {FormatNumber(originalHours)}. Заполненный табель: {FormatNumber(filledHours)}. Разница: {FormatNumber(difference)} час(а/ов)";
+        AddCommentSafe(outputSheet.Cells[outputRow, outputCol], comment);
+        protocol.Add($"{fio};{day};Табель={originalHours};СКУД={filledHours};Разница={difference};Существенное расхождение");
     }
 
     private static dynamic FindWorksheetWithTimesheet(dynamic workbook, out TimesheetStructure structure)
