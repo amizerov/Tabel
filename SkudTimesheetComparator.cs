@@ -71,17 +71,23 @@ public static class SkudTimesheetComparator
 
             originalBook = excel.Workbooks.Open(originalPath);
             dynamic originalSheet = FindWorksheetWithTimesheet(originalBook, out TimesheetStructure originalStructure);
-            object[,] originalValues = ToArray2D(((dynamic)originalSheet.UsedRange).Value2);
-            int originalRows = originalSheet.UsedRange.Rows.Count;
-            int originalCols = originalSheet.UsedRange.Columns.Count;
+            dynamic originalUsedRange = originalSheet.UsedRange;
+            object[,] originalValues = ToArray2D(originalUsedRange.Value2);
+            int originalRows = originalUsedRange.Rows.Count;
+            int originalCols = originalUsedRange.Columns.Count;
+            ReleaseComObject(originalUsedRange);
             originalStructure = originalStructure with { Values = originalValues, UsedRows = originalRows, UsedCols = originalCols };
 
             filledBook = excel.Workbooks.Open(filledPath);
             dynamic filledSheet = FindWorksheetWithTimesheet(filledBook, out TimesheetStructure filledStructure);
-            object[,] filledValues = ToArray2D(((dynamic)filledSheet.UsedRange).Value2);
-            int filledRows = filledSheet.UsedRange.Rows.Count;
-            int filledCols = filledSheet.UsedRange.Columns.Count;
+            dynamic filledUsedRange = filledSheet.UsedRange;
+            object[,] filledValues = ToArray2D(filledUsedRange.Value2);
+            int filledRows = filledUsedRange.Rows.Count;
+            int filledCols = filledUsedRange.Columns.Count;
+            ReleaseComObject(filledUsedRange);
             filledStructure = filledStructure with { Values = filledValues, UsedRows = filledRows, UsedCols = filledCols };
+
+            AlignDateColumns(ref originalStructure, ref filledStructure);
 
             originalBook.Close(false);
             filledBook.Close(false);
@@ -207,12 +213,12 @@ public static class SkudTimesheetComparator
 
             foreach (var pair in originalStructure.DayColumns)
             {
-                int day = pair.Key;
+                DateTime date = pair.Key;
                 int originalCol = pair.Value;
 
-                if (!filledStructure.DayColumns.TryGetValue(day, out int filledCol))
+                if (!filledStructure.DayColumns.TryGetValue(date, out int filledCol))
                 {
-                    protocol.Add($"{originalEmployee.OriginalName};{day};;;;Дневная колонка не найдена в заполненном табеле");
+                    protocol.Add($"{originalEmployee.OriginalName};{FormatDateKey(date)};;;;Дневная колонка не найдена в заполненном табеле");
                     stats.ReadErrors++;
                     continue;
                 }
@@ -234,7 +240,7 @@ public static class SkudTimesheetComparator
                         filledEmployee.RowIndex,
                         filledCol,
                         originalEmployee.OriginalName,
-                        day,
+                        date,
                         originalCell.Value,
                         filledCell.Value,
                         protocol,
@@ -251,7 +257,7 @@ public static class SkudTimesheetComparator
                         filledEmployee.RowIndex,
                         filledCol,
                         originalEmployee.OriginalName,
-                        day,
+                        date,
                         originalHours,
                         filledHours,
                         protocol,
@@ -260,7 +266,7 @@ public static class SkudTimesheetComparator
                 else
                 {
                     stats.ReadErrors++;
-                    protocol.Add($"{originalEmployee.OriginalName};{day};Табель={originalCell.Text};СКУД={filledCell.Text};;Ошибка чтения / ручная проверка");
+                    protocol.Add($"{originalEmployee.OriginalName};{FormatDateKey(date)};Табель={originalCell.Text};СКУД={filledCell.Text};;Ошибка чтения / ручная проверка");
                 }
 
                 currentComparison++;
@@ -280,7 +286,7 @@ public static class SkudTimesheetComparator
         int outputRow,
         int outputCol,
         string fio,
-        int day,
+        DateTime date,
         double originalHours,
         double filledHours,
         List<string> protocol,
@@ -295,35 +301,37 @@ public static class SkudTimesheetComparator
         {
             stats.AllowedDifferences++;
             HighlightCellGreen(outputSheet.Cells[outputRow, outputCol]);
-            protocol.Add($"{fio};{day};Табель={originalHours};СКУД={filledHours};Разница={difference};Допустимое расхождение");
+            protocol.Add($"{fio};{FormatDateKey(date)};Табель={originalHours};СКУД={filledHours};Разница={difference};Допустимое расхождение");
             return;
         }
 
         if (Math.Abs(difference - 1) < 0.000001)
         {
             stats.AllowedDifferences++;
-            protocol.Add($"{fio};{day};Табель={originalHours};СКУД={filledHours};Разница={difference};Допустимое расхождение без выделения");
+            protocol.Add($"{fio};{FormatDateKey(date)};Табель={originalHours};СКУД={filledHours};Разница={difference};Допустимое расхождение без выделения");
             return;
         }
 
         stats.SignificantDifferences++;
         HighlightCellYellow(outputSheet.Cells[outputRow, outputCol]);
         string comment = $"Исходный табель: {FormatNumber(originalHours)}. Заполненный табель: {FormatNumber(filledHours)}. Разница: {FormatNumber(difference)} час(а/ов)";
-        AddCommentSafe(outputSheet.Cells[outputRow, outputCol], comment);
-        protocol.Add($"{fio};{day};Табель={originalHours};СКУД={filledHours};Разница={difference};Существенное расхождение");
+        AddOrAppendComparisonComment(outputSheet.Cells[outputRow, outputCol], comment);
+        protocol.Add($"{fio};{FormatDateKey(date)};Табель={originalHours};СКУД={filledHours};Разница={difference};Существенное расхождение");
     }
 
     private static dynamic FindWorksheetWithTimesheet(dynamic workbook, out TimesheetStructure structure)
     {
         int sheetsCount = workbook.Worksheets.Count;
+        Exception? lastStructureError = null;
 
         for (int i = 1; i <= sheetsCount; i++)
         {
             dynamic sheet = workbook.Worksheets[i];
+            dynamic? usedRange = null;
 
             try
             {
-                dynamic usedRange = sheet.UsedRange;
+                usedRange = sheet.UsedRange;
                 object[,] values = ToArray2D(usedRange.Value2);
                 int usedRows = usedRange.Rows.Count;
                 int usedCols = usedRange.Columns.Count;
@@ -331,10 +339,18 @@ public static class SkudTimesheetComparator
                 if (TryDetectTimesheetStructure(values, usedRows, usedCols, out structure))
                     return sheet;
             }
-            catch { }
+            catch (Exception ex)
+            {
+                lastStructureError = ex;
+            }
+            finally
+            {
+                if (usedRange != null)
+                    ReleaseComObject(usedRange);
+            }
         }
 
-        throw new Exception("Не удалось определить структуру табеля для сравнения. Не найдены колонка ФИО и строка с датами.");
+        throw lastStructureError ?? new Exception("Не удалось определить структуру табеля для сравнения. Не найдены колонка ФИО и строка с датами.");
     }
 
     private static bool TryDetectTimesheetStructure(object[,] values, int usedRows, int usedCols, out TimesheetStructure structure)
@@ -342,15 +358,12 @@ public static class SkudTimesheetComparator
         int fioCol = FindFioColumn(values, usedRows, usedCols, out int headerRow);
 
         if (fioCol < 0)
-        {
-            structure = default!;
-            return false;
-        }
+            throw new Exception("В табеле не найдена колонка ФИО.");
 
         int dateRow = -1;
-        Dictionary<int, int> dayColumns = new();
+        Dictionary<DateTime, int> dayColumns = new();
 
-        for (int row = 1; row <= Math.Min(15, usedRows); row++)
+        foreach (int row in GetDateRowSearchOrder(headerRow, usedRows))
         {
             var current = ReadDayColumns(values, row, usedCols);
             if (current.Count > dayColumns.Count)
@@ -361,10 +374,7 @@ public static class SkudTimesheetComparator
         }
 
         if (dayColumns.Count < 5)
-        {
-            structure = default!;
-            return false;
-        }
+            throw new Exception("В табеле не найдена строка с датами или номерами дней месяца.");
 
         structure = new TimesheetStructure(
             headerRow,
@@ -375,22 +385,86 @@ public static class SkudTimesheetComparator
             FindTotalColumn(values, Math.Max(headerRow, dateRow), usedCols),
             values,
             usedRows,
-            usedCols);
+            usedCols,
+            dayColumns.Keys.All(IsSyntheticDateKey));
 
         return true;
     }
 
-    private static Dictionary<int, int> ReadDayColumns(object[,] values, int row, int usedCols)
+    private static void AlignDateColumns(ref TimesheetStructure originalStructure, ref TimesheetStructure filledStructure)
     {
-        var result = new Dictionary<int, int>();
+        if (originalStructure.UsesSyntheticDayNumbers && !filledStructure.UsesSyntheticDayNumbers)
+            originalStructure = originalStructure with { DayColumns = RebaseSyntheticDayColumns(originalStructure.DayColumns, filledStructure.DayColumns) };
 
-        for (int col = 1; col <= usedCols; col++)
+        if (filledStructure.UsesSyntheticDayNumbers && !originalStructure.UsesSyntheticDayNumbers)
+            filledStructure = filledStructure with { DayColumns = RebaseSyntheticDayColumns(filledStructure.DayColumns, originalStructure.DayColumns) };
+    }
+
+    private static Dictionary<DateTime, int> RebaseSyntheticDayColumns(Dictionary<DateTime, int> source, Dictionary<DateTime, int> target)
+    {
+        var targetMonths = target.Keys
+            .Where(x => !IsSyntheticDateKey(x))
+            .Select(x => new DateTime(x.Year, x.Month, 1))
+            .Distinct()
+            .ToList();
+
+        if (targetMonths.Count != 1)
+            return source;
+
+        DateTime month = targetMonths[0];
+        var result = new Dictionary<DateTime, int>();
+
+        foreach (var pair in source)
         {
-            if (TryReadDay(values[row, col], out int day))
-                result[day] = col;
+            int day = pair.Key.Day;
+            if (day <= DateTime.DaysInMonth(month.Year, month.Month))
+                result[new DateTime(month.Year, month.Month, day)] = pair.Value;
         }
 
         return result;
+    }
+
+    private static bool IsSyntheticDateKey(DateTime date)
+    {
+        return date.Year == 2000 && date.Month == 1;
+    }
+
+    private static Dictionary<DateTime, int> ReadDayColumns(object[,] values, int row, int usedCols)
+    {
+        var result = new Dictionary<DateTime, int>();
+        DateTime? rowMonth = TryFindRowMonth(values, row, usedCols);
+
+        for (int col = 1; col <= usedCols; col++)
+        {
+            if (TryReadDateColumn(values[row, col], rowMonth, out DateTime date))
+                result[date.Date] = col;
+        }
+
+        return result;
+    }
+
+    private static IEnumerable<int> GetDateRowSearchOrder(int headerRow, int usedRows)
+    {
+        int[] offsets = { 1, 0, 2, -1, 3, -2 };
+        var seen = new HashSet<int>();
+
+        foreach (int offset in offsets)
+        {
+            int row = headerRow + offset;
+            if (row >= 1 && row <= usedRows && seen.Add(row))
+                yield return row;
+        }
+    }
+
+    private static DateTime? TryFindRowMonth(object[,] values, int row, int usedCols)
+    {
+        for (int col = 1; col <= usedCols; col++)
+        {
+            if (TryReadFullDate(values[row, col], out DateTime date))
+                return new DateTime(date.Year, date.Month, 1);
+        }
+
+        return null;
     }
 
     private static int? FindTotalColumn(object[,] values, int row, int usedCols)
@@ -547,9 +621,50 @@ public static class SkudTimesheetComparator
         return -1;
     }
 
-    private static bool TryReadDay(object value, out int day)
+    private static bool TryReadDateColumn(object value, DateTime? rowMonth, out DateTime date)
     {
-        day = 0;
+        date = default;
+
+        if (value == null)
+            return false;
+
+        if (TryReadFullDate(value, out DateTime fullDate))
+        {
+            date = fullDate.Date;
+            return true;
+        }
+
+        if (value is double d)
+        {
+            if (d >= 1 && d <= 31 && Math.Abs(d - Math.Round(d)) < 0.001)
+            {
+                int day = (int)Math.Round(d);
+                DateTime month = rowMonth ?? new DateTime(2000, 1, 1);
+                if (day <= DateTime.DaysInMonth(month.Year, month.Month))
+                {
+                    date = new DateTime(month.Year, month.Month, day);
+                    return true;
+                }
+            }
+        }
+
+        string text = GetValueText(value);
+        if (int.TryParse(text, out int parsed) && parsed >= 1 && parsed <= 31)
+        {
+            DateTime month = rowMonth ?? new DateTime(2000, 1, 1);
+            if (parsed <= DateTime.DaysInMonth(month.Year, month.Month))
+            {
+                date = new DateTime(month.Year, month.Month, parsed);
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static bool TryReadFullDate(object value, out DateTime date)
+    {
+        date = default;
 
         if (value == null)
             return false;
@@ -557,17 +672,14 @@ public static class SkudTimesheetComparator
         if (value is double d)
         {
             if (d >= 1 && d <= 31 && Math.Abs(d - Math.Round(d)) < 0.001)
-            {
-                day = (int)Math.Round(d);
-                return true;
-            }
+                return false;
 
             try
             {
-                var date = DateTime.FromOADate(d);
-                if (date.Year > 1900)
+                var excelDate = DateTime.FromOADate(d);
+                if (excelDate.Year > 1900)
                 {
-                    day = date.Day;
+                    date = excelDate.Date;
                     return true;
                 }
             }
@@ -575,15 +687,12 @@ public static class SkudTimesheetComparator
         }
 
         string text = GetValueText(value);
-        if (int.TryParse(text, out int parsed) && parsed >= 1 && parsed <= 31)
-        {
-            day = parsed;
-            return true;
-        }
+        if (int.TryParse(text, out _))
+            return false;
 
-        if (DateTime.TryParse(text, CultureInfo.GetCultureInfo("ru-RU"), DateTimeStyles.None, out DateTime dt))
+        if (DateTime.TryParse(text, CultureInfo.GetCultureInfo("ru-RU"), DateTimeStyles.None, out DateTime parsed))
         {
-            day = dt.Day;
+            date = parsed.Date;
             return true;
         }
 
@@ -696,6 +805,13 @@ public static class SkudTimesheetComparator
         return value.ToString("0.##", CultureInfo.GetCultureInfo("ru-RU"));
     }
 
+    private static string FormatDateKey(DateTime date)
+    {
+        return date.Year == 2000 && date.Month == 1
+            ? date.Day.ToString(CultureInfo.InvariantCulture)
+            : date.ToString("dd.MM.yyyy", CultureInfo.InvariantCulture);
+    }
+
     private static void HighlightCellYellow(dynamic cell)
     {
         try { cell.Interior.Color = RGB(255, 255, 0); } catch { }
@@ -712,6 +828,33 @@ public static class SkudTimesheetComparator
         {
             try { var old = cell.Comment; if (old != null) old.Delete(); } catch { }
             cell.AddComment(commentText);
+            try { cell.Comment.Shape.TextFrame.AutoSize = true; } catch { }
+        }
+        catch { }
+    }
+
+    private static void AddOrAppendComparisonComment(dynamic cell, string comparisonText)
+    {
+        string block = "Сравнение: " + comparisonText;
+
+        try
+        {
+            string existingText = string.Empty;
+
+            try
+            {
+                var old = cell.Comment;
+                if (old != null)
+                    existingText = Convert.ToString(old.Text())?.Trim() ?? string.Empty;
+            }
+            catch { }
+
+            string newText = string.IsNullOrWhiteSpace(existingText)
+                ? block
+                : existingText + Environment.NewLine + Environment.NewLine + block;
+
+            try { var old = cell.Comment; if (old != null) old.Delete(); } catch { }
+            cell.AddComment(newText);
             try { cell.Comment.Shape.TextFrame.AutoSize = true; } catch { }
         }
         catch { }
@@ -766,11 +909,12 @@ public static class SkudTimesheetComparator
         int DateRow,
         int FirstEmployeeRow,
         int FioCol,
-        Dictionary<int, int> DayColumns,
+        Dictionary<DateTime, int> DayColumns,
         int? TotalHoursCol,
         object[,] Values,
         int UsedRows,
-        int UsedCols);
+        int UsedCols,
+        bool UsesSyntheticDayNumbers);
 
     private sealed record TimesheetEmployee(
         int RowIndex,

@@ -171,7 +171,7 @@ public static class SkudExcelInteropFiller
     {
         dynamic sheet = FindTimesheetWorksheet(workbook, month, protocol, out TimesheetStructure structure);
 
-        if (skudMonths.Count > 1 && (structure.UsesSyntheticDayNumbers || HasOnlyDayNumberDateHeaders(structure)))
+        if (skudMonths.Count > 1 && HasOnlyDayNumberDateHeaders(structure))
             throw new Exception("В СКУД найдены записи за несколько месяцев, а в табеле даты указаны только номерами дней. Укажите в табеле полные даты или используйте выгрузку СКУД за один месяц.");
 
         Report("Анализ табеля", $"Лист табеля найден. Строка дат: {structure.DateRow}, колонка ФИО: {ColumnName(structure.FioCol)}.", 0, 100, 50);
@@ -282,14 +282,16 @@ public static class SkudExcelInteropFiller
     private static dynamic FindTimesheetWorksheet(dynamic workbook, DateTime month, ProcessingProtocol protocol, out TimesheetStructure structure)
     {
         int sheetsCount = workbook.Worksheets.Count;
+        Exception? lastStructureError = null;
 
         for (int i = 1; i <= sheetsCount; i++)
         {
             dynamic sheet = workbook.Worksheets[i];
+            dynamic? usedRange = null;
 
             try
             {
-                dynamic usedRange = sheet.UsedRange;
+                usedRange = sheet.UsedRange;
                 object[,] values = ToArray2D(usedRange.Value2);
                 int usedRows = usedRange.Rows.Count;
                 int usedCols = usedRange.Columns.Count;
@@ -299,11 +301,17 @@ public static class SkudExcelInteropFiller
             }
             catch (Exception ex)
             {
+                lastStructureError = ex;
                 protocol.Errors.Add($"Табель; лист {i}; ошибка анализа структуры; {ex.Message}");
+            }
+            finally
+            {
+                if (usedRange != null)
+                    ReleaseComObject(usedRange);
             }
         }
 
-        throw new Exception("Не удалось определить лист табеля. Не найдены ФИО сотрудников или строка с датами.");
+        throw lastStructureError ?? new Exception("Не удалось определить лист табеля. Не найдены ФИО сотрудников или строка с датами.");
     }
 
     private static bool TryDetectTimesheetStructure(
@@ -318,39 +326,38 @@ public static class SkudExcelInteropFiller
         int fioCol = FindFioColumn(values, usedRows, usedCols, out int headerRow);
 
         if (fioCol < 0)
-            throw new Exception("Ошибка структуры табеля: не найдена колонка ФИО. Добавьте заголовок \"ФИО\" или \"Фамилия\".");
+            throw new Exception("В табеле не найдена колонка ФИО.");
 
         var dateColumns = new Dictionary<DateTime, int>();
         int dateRow = -1;
-        bool usesSyntheticDayNumbers = false;
+        var dateRowCandidates = new List<(int Row, Dictionary<DateTime, int> Columns)>();
 
-        for (int row = 1; row <= Math.Min(15, usedRows); row++)
+        foreach (int row in GetDateRowSearchOrder(headerRow, usedRows))
         {
             var detected = ReadDateColumns(values, row, usedCols, month);
             if (detected.Count >= 5)
-            {
-                dateColumns = detected;
-                dateRow = row;
-                break;
-            }
+                dateRowCandidates.Add((row, detected));
         }
 
-        if (dateColumns.Count == 0 && usedRows >= 4 && usedCols >= 31)
+        if (dateRowCandidates.Count > 0)
         {
-            dateRow = 4;
-            usesSyntheticDayNumbers = true;
-            for (int col = 4; col <= Math.Min(31, usedCols); col++)
-            {
-                int day = col - 3;
-                if (day <= DateTime.DaysInMonth(month.Year, month.Month))
-                    dateColumns[new DateTime(month.Year, month.Month, day)] = col;
-            }
+            var selected = dateRowCandidates
+                .OrderBy(x => Math.Abs(x.Row - headerRow))
+                .ThenBy(x => x.Row)
+                .First();
 
-            protocol.General.Add("Использован fallback структуры табеля: строка дат = 4, дневные столбцы = D:AE, итоговая колонка = AF.");
+            dateRow = selected.Row;
+            dateColumns = selected.Columns;
+
+            if (dateRowCandidates.Count > 1)
+            {
+                string rows = string.Join(", ", dateRowCandidates.Select(x => x.Row));
+                protocol.General.Add($"Табель; найдено несколько возможных строк дат: {rows}. Выбрана ближайшая к строке ФИО: {dateRow}.");
+            }
         }
 
         if (dateColumns.Count == 0)
-            return false;
+            throw new Exception("В табеле не найдена строка с датами или номерами дней месяца.");
 
         if (!HasEmployeeLikeRows(values, usedRows, fioCol, Math.Max(headerRow, dateRow) + 1))
             return false;
@@ -364,8 +371,7 @@ public static class SkudExcelInteropFiller
             dateColumns,
             totalCol ?? (usedCols >= 32 ? 32 : null),
             values,
-            usedRows,
-            usesSyntheticDayNumbers);
+            usedRows);
 
         return true;
     }
@@ -379,10 +385,11 @@ public static class SkudExcelInteropFiller
         for (int sheetIndex = 1; sheetIndex <= sheetsCount; sheetIndex++)
         {
             dynamic sheet = workbook.Worksheets[sheetIndex];
+            dynamic? usedRange = null;
 
             try
             {
-                dynamic usedRange = sheet.UsedRange;
+                usedRange = sheet.UsedRange;
                 object[,] values = ToArray2D(usedRange.Value2);
                 int usedRows = usedRange.Rows.Count;
                 int usedCols = usedRange.Columns.Count;
@@ -461,6 +468,11 @@ public static class SkudExcelInteropFiller
             catch (Exception ex)
             {
                 protocol.Errors.Add($"СКУД; {Path.GetFileName(filePath)}; лист {sheetIndex}; ошибка чтения; {ex.Message}");
+            }
+            finally
+            {
+                if (usedRange != null)
+                    ReleaseComObject(usedRange);
             }
         }
 
@@ -668,6 +680,19 @@ public static class SkudExcelInteropFiller
         }
 
         return result;
+    }
+
+    private static IEnumerable<int> GetDateRowSearchOrder(int headerRow, int usedRows)
+    {
+        int[] offsets = { 1, 0, 2, -1, 3, -2 };
+        var seen = new HashSet<int>();
+
+        foreach (int offset in offsets)
+        {
+            int row = headerRow + offset;
+            if (row >= 1 && row <= usedRows && seen.Add(row))
+                yield return row;
+        }
     }
 
     private static bool HasOnlyDayNumberDateHeaders(TimesheetStructure structure)
@@ -1224,8 +1249,7 @@ public static class SkudExcelInteropFiller
         Dictionary<DateTime, int> DateColumns,
         int? TotalHoursCol,
         object[,] Values,
-        int UsedRows,
-        bool UsesSyntheticDayNumbers);
+        int UsedRows);
 
     private sealed record TimesheetEmployee(int RowIndex, string OriginalName);
 
