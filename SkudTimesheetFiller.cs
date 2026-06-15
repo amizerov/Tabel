@@ -362,14 +362,16 @@ public static class SkudExcelInteropFiller
         if (!HasEmployeeLikeRows(values, usedRows, fioCol, Math.Max(headerRow, dateRow) + 1))
             return false;
 
-        int? totalCol = FindTotalColumn(values, Math.Max(headerRow, dateRow), usedCols);
+        int? totalCol = FindTotalColumn(values, headerRow, usedCols)
+            ?? FindTotalColumn(values, dateRow, usedCols)
+            ?? FindTotalColumnAfterLastMonthDate(dateColumns, month);
         structure = new TimesheetStructure(
             Math.Max(headerRow, dateRow),
             dateRow,
             Math.Max(headerRow, dateRow) + 1,
             fioCol,
             dateColumns,
-            totalCol ?? (usedCols >= 32 ? 32 : null),
+            totalCol,
             values,
             usedRows);
 
@@ -813,16 +815,26 @@ public static class SkudExcelInteropFiller
     private static int? FindTotalColumn(object[,] values, int row, int usedCols)
     {
         if (row <= 0)
-            return usedCols >= 32 ? 32 : null;
+            return null;
 
         for (int col = 1; col <= usedCols; col++)
         {
             string header = NormalizeHeader(GetValueText(values[row, col]));
-            if (header.Contains("итог"))
+            if (header == "итого часов")
                 return col;
         }
 
-        return usedCols >= 32 ? 32 : null;
+        return null;
+    }
+
+    private static int? FindTotalColumnAfterLastMonthDate(Dictionary<DateTime, int> dateColumns, DateTime month)
+    {
+        var monthDateColumns = dateColumns
+            .Where(x => x.Key.Year == month.Year && x.Key.Month == month.Month)
+            .Select(x => x.Value)
+            .ToList();
+
+        return monthDateColumns.Count == 0 ? null : monthDateColumns.Max() + 1;
     }
 
     private static void RecalculateTotal(dynamic sheet, int row, TimesheetStructure structure, ProcessingProtocol protocol)
