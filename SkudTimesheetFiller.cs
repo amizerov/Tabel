@@ -194,7 +194,28 @@ public static class SkudExcelInteropFiller
             if (search.Status == PersonSearchResult.NotFound)
             {
                 result.NotFoundEmployees++;
-                HighlightCellNotFound(sheet.Cells[employee.RowIndex, structure.FioCol], search.SearchKey);
+
+                foreach (var dateColumn in structure.DateColumns.OrderBy(x => x.Key))
+                {
+                    DateTime date = dateColumn.Key.Date;
+                    int col = dateColumn.Value;
+
+                    if (date.Month != month.Month || date.Year != month.Year || date.Day > daysInMonth)
+                        continue;
+
+                    if (!TryGetDeclaredShiftHours(structure, employee.RowIndex, col, out _))
+                        continue;
+
+                    dynamic cell = sheet.Cells[employee.RowIndex, col];
+                    MarkDeclaredShiftWithoutEmployeeInSkud(cell);
+                    protocol.Filling.Add(
+                        $"{employee.OriginalName}; {date:dd.MM.yyyy}; часы=; " +
+                        "статус=Смена заявлена, сотрудник не найден в данных СКУД");
+                }
+
+                if (structure.TotalHoursCol.HasValue)
+                    RecalculateTotal(sheet, employee.RowIndex, structure, protocol);
+
                 continue;
             }
 
@@ -207,7 +228,6 @@ public static class SkudExcelInteropFiller
 
             result.MatchedEmployees++;
             var personDays = eventsByPerson[search.PersonKey!];
-            var missingDates = new List<DateTime>();
 
             foreach (var dateColumn in structure.DateColumns.OrderBy(x => x.Key))
             {
@@ -217,9 +237,18 @@ public static class SkudExcelInteropFiller
                 if (date.Month != month.Month || date.Year != month.Year || date.Day > daysInMonth)
                     continue;
 
+                // Обрабатываем только даты, на которые в исходном табеле была заявлена смена.
+                // Пустые и незапланированные даты не заполняем, не комментируем и не выделяем.
+                if (!TryGetDeclaredShiftHours(structure, employee.RowIndex, col, out double declaredHours))
+                    continue;
+
                 if (!personDays.TryGetValue(date, out var dayEvents) || !dayEvents.HasAnyEvents)
                 {
-                    missingDates.Add(date);
+                    dynamic missingCell = sheet.Cells[employee.RowIndex, col];
+                    MarkDeclaredShiftWithoutAllowedSkudEvents(missingCell, declaredHours);
+                    protocol.Filling.Add(
+                        $"{employee.OriginalName}; {date:dd.MM.yyyy}; заявлено={FormatHours(declaredHours)}; часы=; " +
+                        "статус=Разрешённые отметки в СКУД отсутствуют");
                     continue;
                 }
 
@@ -230,6 +259,16 @@ public static class SkudExcelInteropFiller
                     protocol.Filling.Add(
                         $"{employee.OriginalName}; {date:dd.MM.yyyy}; проблемных сообщений СКУД={calc.ProblemEventCount}; " +
                         $"сообщения={string.Join("; ", calc.ProblemMessages)}");
+                }
+
+                if (calc.EventCount == 0)
+                {
+                    dynamic missingAllowedCell = sheet.Cells[employee.RowIndex, col];
+                    MarkDeclaredShiftWithoutAllowedSkudEvents(missingAllowedCell, declaredHours);
+                    protocol.Filling.Add(
+                        $"{employee.OriginalName}; {date:dd.MM.yyyy}; заявлено={FormatHours(declaredHours)}; часы=; " +
+                        "статус=Разрешённые отметки в СКУД отсутствуют");
+                    continue;
                 }
 
                 if (calc.RequiresManualReview)
@@ -260,12 +299,6 @@ public static class SkudExcelInteropFiller
                 protocol.Filling.Add(
                     $"{employee.OriginalName}; {date:dd.MM.yyyy}; событий={calc.EventCount}; " +
                     $"первое={FormatTime(calc.FirstEvent)}; последнее={FormatTime(calc.LastEvent)}; часы={calc.Hours}; статус={calc.Status}");
-            }
-
-            if (missingDates.Count > 0)
-            {
-                HighlightFioMissingDates(sheet.Cells[employee.RowIndex, structure.FioCol], missingDates, structure.DateColumns.Count);
-                protocol.Filling.Add($"{employee.OriginalName}; даты без записей СКУД={FormatDateList(missingDates)}; количество={missingDates.Count}");
             }
 
             if (structure.TotalHoursCol.HasValue)
@@ -855,7 +888,10 @@ public static class SkudExcelInteropFiller
             try
             {
                 if (totalCell.HasFormula == true)
+                {
+                    try { totalCell.Calculate(); } catch { }
                     return;
+                }
             }
             catch { }
 
@@ -1050,39 +1086,60 @@ public static class SkudExcelInteropFiller
         try { cell.NumberFormat = "0"; } catch { }
     }
 
-    private static void HighlightCellNotFound(dynamic cell, string searchKey)
+    private static bool TryGetDeclaredShiftHours(TimesheetStructure structure, int row, int col, out double hours)
     {
-        try { cell.Interior.Color = RGB(255, 200, 200); } catch { }
-        AddCommentSafe(cell, $"ФИО не найдено в выгрузке СКУД.\nКлюч поиска: {searchKey}");
+        hours = 0;
+
+        try
+        {
+            object value = structure.Values[row, col];
+
+            if (!TryConvertToDouble(value, out double parsedHours))
+                return false;
+
+            if (double.IsNaN(parsedHours) || double.IsInfinity(parsedHours) || parsedHours <= 0)
+                return false;
+
+            hours = parsedHours;
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static void MarkDeclaredShiftWithoutAllowedSkudEvents(dynamic cell, double declaredHours)
+    {
+        ClearCellContentsSafe(cell);
+        try { cell.Interior.Color = RGB(255, 199, 206); } catch { }
+        AddCommentSafe(
+            cell,
+            $"Смена заявлена на {FormatHours(declaredHours)} часов, но разрешённые отметки в СКУД отсутствуют");
+    }
+
+    private static void MarkDeclaredShiftWithoutEmployeeInSkud(dynamic cell)
+    {
+        ClearCellContentsSafe(cell);
+        try { cell.Interior.Color = RGB(255, 199, 206); } catch { }
+        AddCommentSafe(cell, "Смена заявлена, сотрудник не найден в данных СКУД");
+    }
+
+    private static void ClearCellContentsSafe(dynamic cell)
+    {
+        try { cell.ClearContents(); return; } catch { }
+        try { cell.Value2 = null; } catch { }
+    }
+
+    private static string FormatHours(double hours)
+    {
+        return hours.ToString("0.##", CultureInfo.CurrentCulture);
     }
 
     private static void HighlightCellAmbiguous(dynamic cell, string searchKey, List<string> variants)
     {
         try { cell.Interior.Color = RGB(255, 165, 0); } catch { }
         AddCommentSafe(cell, $"Неоднозначное сопоставление ФИО.\nКлюч поиска: {searchKey}\nНайденные варианты: {string.Join(", ", variants)}");
-    }
-
-    private static void HighlightFioMissingDates(dynamic cell, List<DateTime> missingDates, int totalDateColumns)
-    {
-        try { cell.Interior.Color = RGB(189, 215, 238); } catch { }
-
-        string comment = missingDates.Count >= totalDateColumns
-            ? "По сотруднику нет записей СКУД за период табеля."
-            : $"По сотруднику есть даты без записей СКУД: {FormatDateList(missingDates)}.";
-
-        AddCommentSafe(cell, comment);
-    }
-
-    private static string FormatDateList(List<DateTime> dates)
-    {
-        const int maxDatesInComment = 20;
-        var ordered = dates.OrderBy(x => x).ToList();
-        string text = string.Join(", ", ordered.Take(maxDatesInComment).Select(x => x.ToString("dd.MM.yyyy", CultureInfo.InvariantCulture)));
-
-        if (ordered.Count > maxDatesInComment)
-            text += $" и еще {ordered.Count - maxDatesInComment}";
-
-        return text;
     }
 
     private static void AddCommentSafe(dynamic cell, string commentText)
