@@ -117,7 +117,7 @@
             Controls.Add(btnDoIt);
             FormBorderStyle = FormBorderStyle.FixedToolWindow;
             Name = "FrmMain";
-            Text = "Табель СКУД версия 1106";
+            Text = "Табель СКУД версия 0808";
             ResumeLayout(false);
             PerformLayout();
         }

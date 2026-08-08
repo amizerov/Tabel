@@ -292,31 +292,31 @@ public static class SkudTimesheetComparator
         List<string> protocol,
         ComparisonStats stats)
     {
-        double difference = Math.Abs(filledHours - originalHours);
+        // Разница как исходный - заполненный (signed). При любых допустимых расхождениях — выделяем и комментируем.
+        double difference = originalHours - filledHours;
 
-        if (difference == 0)
-            return;
+        if (Math.Abs(difference) < 1e-9)
+            return; // совпадает
 
-        if (difference < 1)
+        double absDiff = Math.Abs(difference);
+
+        // Любая разница до и включая 1 часа считаем допустимой и подсвечиваем (восстановление поведения до ранних версий)
+        if (absDiff <= 1.0)
         {
             stats.AllowedDifferences++;
-            HighlightCellGreen(outputSheet.Cells[outputRow, outputCol]);
-            protocol.Add($"{fio};{FormatDateKey(date)};Табель={originalHours};СКУД={filledHours};Разница={difference};Допустимое расхождение");
+            try { HighlightCellGreen(outputSheet.Cells[outputRow, outputCol]); } catch { }
+            string comment = $"Исходный табель: {FormatNumber(originalHours)}. Заполненный табель: {FormatNumber(filledHours)}. Разница: {FormatNumber(absDiff)} час(а/ов)";
+            try { AddOrAppendComparisonComment(outputSheet.Cells[outputRow, outputCol], comment); } catch { }
+            protocol.Add($"{fio};{FormatDateKey(date)};Табель={originalHours};СКУД={filledHours};Разница={absDiff};Допустимое расхождение");
             return;
         }
 
-        if (Math.Abs(difference - 1) < 0.000001)
-        {
-            stats.AllowedDifferences++;
-            protocol.Add($"{fio};{FormatDateKey(date)};Табель={originalHours};СКУД={filledHours};Разница={difference};Допустимое расхождение без выделения");
-            return;
-        }
-
+        // Существенное расхождение
         stats.SignificantDifferences++;
-        HighlightCellYellow(outputSheet.Cells[outputRow, outputCol]);
-        string comment = $"Исходный табель: {FormatNumber(originalHours)}. Заполненный табель: {FormatNumber(filledHours)}. Разница: {FormatNumber(difference)} час(а/ов)";
-        AddOrAppendComparisonComment(outputSheet.Cells[outputRow, outputCol], comment);
-        protocol.Add($"{fio};{FormatDateKey(date)};Табель={originalHours};СКУД={filledHours};Разница={difference};Существенное расхождение");
+        try { HighlightCellYellow(outputSheet.Cells[outputRow, outputCol]); } catch { }
+        string bigComment = $"Исходный табель: {FormatNumber(originalHours)}. Заполненный табель: {FormatNumber(filledHours)}. Разница: {FormatNumber(absDiff)} час(а/ов)";
+        try { AddOrAppendComparisonComment(outputSheet.Cells[outputRow, outputCol], bigComment); } catch { }
+        protocol.Add($"{fio};{FormatDateKey(date)};Табель={originalHours};СКУД={filledHours};Разница={absDiff};Существенное расхождение");
     }
 
     private static dynamic FindWorksheetWithTimesheet(dynamic workbook, out TimesheetStructure structure)
