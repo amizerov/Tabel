@@ -14,17 +14,21 @@ internal sealed class HelpForm : Form
         Size = new Size(900, 700);
         KeyPreview = true;
 
-        var browser = new WebBrowser
+        var tabs = new TabControl
         {
             Dock = DockStyle.Fill,
-            AllowWebBrowserDrop = false,
-            IsWebBrowserContextMenuEnabled = true,
-            ScriptErrorsSuppressed = true,
-            WebBrowserShortcutsEnabled = true,
-            DocumentText = LoadHelpHtml()
+            Font = new Font("Segoe UI", 10.5F, FontStyle.Bold),
+            Padding = new Point(18, 6)
         };
 
-        Controls.Add(browser);
+        tabs.TabPages.Add(CreateDocumentPage(
+            "Справка",
+            LoadDocumentHtml("Справка.md", "Табель СКУД", "Справка недоступна")));
+        tabs.TabPages.Add(CreateDocumentPage(
+            "Тех. задание",
+            LoadDocumentHtml("ТЗ.md", "Техническое задание", "ТЗ недоступно")));
+
+        Controls.Add(tabs);
         WindowStateStore.Attach(this, "Help");
         KeyDown += (_, e) =>
         {
@@ -33,24 +37,47 @@ internal sealed class HelpForm : Form
         };
     }
 
-    private static string LoadHelpHtml()
+    private static TabPage CreateDocumentPage(string title, string html)
     {
-        string helpPath = Path.Combine(AppContext.BaseDirectory, "docs", "Справка.md");
+        var page = new TabPage(title)
+        {
+            BackColor = Color.White,
+            Padding = Padding.Empty
+        };
+
+        var browser = new WebBrowser
+        {
+            Dock = DockStyle.Fill,
+            AllowWebBrowserDrop = false,
+            IsWebBrowserContextMenuEnabled = true,
+            ScriptErrorsSuppressed = true,
+            WebBrowserShortcutsEnabled = true,
+            DocumentText = html
+        };
+
+        page.Controls.Add(browser);
+        return page;
+    }
+
+    private static string LoadDocumentHtml(string fileName, string navigationTitle, string errorTitle)
+    {
+        string path = Path.Combine(AppContext.BaseDirectory, "docs", fileName);
 
         try
         {
-            string markdown = File.ReadAllText(helpPath, Encoding.UTF8);
-            return MarkdownToHtml(markdown);
+            string markdown = File.ReadAllText(path, Encoding.UTF8);
+            return MarkdownToHtml(markdown, navigationTitle);
         }
         catch (Exception ex)
         {
             return WrapHtml(
-                $"<h1>Справка недоступна</h1><p>{WebUtility.HtmlEncode(ex.Message)}</p>",
-                string.Empty);
+                $"<h1>{WebUtility.HtmlEncode(errorTitle)}</h1><p>{WebUtility.HtmlEncode(ex.Message)}</p>",
+                string.Empty,
+                navigationTitle);
         }
     }
 
-    private static string MarkdownToHtml(string markdown)
+    private static string MarkdownToHtml(string markdown, string navigationTitle)
     {
         var body = new StringBuilder();
         var navigation = new StringBuilder();
@@ -98,7 +125,7 @@ internal sealed class HelpForm : Form
                 continue;
             }
 
-            Match heading = Regex.Match(line, @"^(#{1,4})\s+(.+)$");
+            Match heading = Regex.Match(line, @"^(#{1,6})\s+(.+)$");
             if (heading.Success)
             {
                 CloseLists();
@@ -162,7 +189,7 @@ internal sealed class HelpForm : Form
         if (inCodeBlock)
             body.AppendLine("</code></pre>");
 
-        return WrapHtml(body.ToString(), navigation.ToString());
+        return WrapHtml(body.ToString(), navigation.ToString(), navigationTitle);
     }
 
     private static string FormatInline(string value)
@@ -177,7 +204,7 @@ internal sealed class HelpForm : Form
         return result;
     }
 
-    private static string WrapHtml(string body, string navigation)
+    private static string WrapHtml(string body, string navigation, string navigationTitle)
     {
         return """
             <!doctype html>
@@ -200,6 +227,9 @@ internal sealed class HelpForm : Form
                 h1 { margin: 0 0 24px; padding-bottom: 14px; color: #0078b8; font-size: 38px; border-bottom: 3px solid #00a0dc; }
                 h2 { margin: 42px 0 14px; padding-top: 6px; color: #006da5; font-size: 29px; border-top: 1px solid #e5edf1; }
                 h3 { margin: 26px 0 10px; color: #204f68; font-size: 23px; }
+                h4 { margin: 22px 0 8px; color: #315f73; font-size: 20px; }
+                h5 { margin: 18px 0 7px; color: #3d6577; font-size: 18px; }
+                h6 { margin: 16px 0 6px; color: #496d7d; font-size: 17px; }
                 p { margin: 8px 0 12px; }
                 ul, ol { margin: 8px 0 16px 26px; padding: 0; }
                 li { margin: 5px 0; }
@@ -218,7 +248,8 @@ internal sealed class HelpForm : Form
                 }
               </style>
             </head>
-            <body><nav><a class="nav-title" href="#top">Табель СКУД</a>
-            """ + navigation + "</nav><div class=\"content\"><main>" + body + "</main></div></body></html>";
+            <body><nav><a class="nav-title" href="#top">
+            """ + WebUtility.HtmlEncode(navigationTitle) + "</a>" + navigation +
+            "</nav><div class=\"content\"><main>" + body + "</main></div></body></html>";
     }
 }

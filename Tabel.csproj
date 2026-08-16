@@ -11,6 +11,7 @@
 
   <ItemGroup>
     <None Update="docs\Справка.md" CopyToOutputDirectory="PreserveNewest" />
+    <None Update="docs\ТЗ.md" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
 </Project>
