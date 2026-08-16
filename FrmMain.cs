@@ -24,6 +24,7 @@ public partial class FrmMain : Form
     {
         InitializeComponent();
         Text = $"Табель СКУД — версия {GetAppVersion()}";
+        WindowStateStore.Attach(this, "Main");
 
         SkudExcelInteropFiller.ProgressChanged += SkudExcelInteropFiller_ProgressChanged;
         SkudTimesheetComparator.ProgressChanged += SkudTimesheetComparator_ProgressChanged;
@@ -245,7 +246,12 @@ public partial class FrmMain : Form
         {
             string result = await SkudExcelInteropFiller.FillTimesheetAsync(timesheetPath, skudPath);
             PrepareComparison(timesheetPath, result);
-            ShowSuccess(result, _lastFillerSummary ?? "Табель успешно заполнен.", "Файл результата:");
+            ShowSuccess(
+                result,
+                _lastFillerSummary ?? "Табель успешно заполнен.",
+                "Файл результата:",
+                BuildResultPath(timesheetPath, "_протокол.txt")!,
+                "Отчёт об обработке табеля");
         }
         catch (Exception ex)
         {
@@ -275,7 +281,12 @@ public partial class FrmMain : Form
         try
         {
             string result = await SkudTimesheetComparator.CompareTimesheetsAsync(originalPath, filledPath);
-            ShowSuccess(result, _lastComparatorSummary ?? "Сравнение табелей завершено.", "Файл сравнения:");
+            ShowSuccess(
+                result,
+                _lastComparatorSummary ?? "Сравнение табелей завершено.",
+                "Файл сравнения:",
+                BuildResultPath(originalPath, "_протокол_сравнения.txt")!,
+                "Отчёт о сравнении табелей");
         }
         catch (Exception ex)
         {
@@ -287,18 +298,20 @@ public partial class FrmMain : Form
         }
     }
 
-    private void ShowSuccess(string result, string summary, string resultCaption)
+    private void ShowSuccess(
+        string result,
+        string summary,
+        string resultCaption,
+        string protocolPath,
+        string reportTitle)
     {
         AddLog("");
         AddLog("Готово.");
         AddLog(resultCaption);
         AddLog(result);
 
-        string dialogText = summary.Contains(result, StringComparison.OrdinalIgnoreCase)
-            ? summary
-            : summary + Environment.NewLine + result;
-
-        MessageBox.Show(dialogText, "Готово", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        using var report = new ProtocolReportForm(reportTitle, summary, resultCaption, result, protocolPath);
+        report.ShowDialog(this);
     }
 
     private void BeginOperation(string message)

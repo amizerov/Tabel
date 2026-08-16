@@ -25,6 +25,7 @@ internal sealed class HelpForm : Form
         };
 
         Controls.Add(browser);
+        WindowStateStore.Attach(this, "Help");
         KeyDown += (_, e) =>
         {
             if (e.KeyCode == Keys.Escape)
@@ -43,16 +44,20 @@ internal sealed class HelpForm : Form
         }
         catch (Exception ex)
         {
-            return WrapHtml($"<h1>Справка недоступна</h1><p>{WebUtility.HtmlEncode(ex.Message)}</p>");
+            return WrapHtml(
+                $"<h1>Справка недоступна</h1><p>{WebUtility.HtmlEncode(ex.Message)}</p>",
+                string.Empty);
         }
     }
 
     private static string MarkdownToHtml(string markdown)
     {
         var body = new StringBuilder();
+        var navigation = new StringBuilder();
         bool inUnorderedList = false;
         bool inOrderedList = false;
         bool inCodeBlock = false;
+        int sectionNumber = 0;
 
         void CloseLists()
         {
@@ -98,7 +103,16 @@ internal sealed class HelpForm : Form
             {
                 CloseLists();
                 int level = heading.Groups[1].Value.Length;
-                body.AppendLine($"<h{level}>{FormatInline(heading.Groups[2].Value)}</h{level}>");
+                string headingText = heading.Groups[2].Value;
+                string id = level == 1 ? "top" : $"section-{++sectionNumber}";
+                body.AppendLine($"<h{level} id=\"{id}\">{FormatInline(headingText)}</h{level}>");
+
+                if (level is 2 or 3)
+                {
+                    string cssClass = level == 2 ? "nav-section" : "nav-subsection";
+                    navigation.AppendLine(
+                        $"<a class=\"{cssClass}\" href=\"#{id}\">{WebUtility.HtmlEncode(headingText)}</a>");
+                }
                 continue;
             }
 
@@ -148,18 +162,22 @@ internal sealed class HelpForm : Form
         if (inCodeBlock)
             body.AppendLine("</code></pre>");
 
-        return WrapHtml(body.ToString());
+        return WrapHtml(body.ToString(), navigation.ToString());
     }
 
     private static string FormatInline(string value)
     {
         string result = WebUtility.HtmlEncode(value);
+        result = Regex.Replace(
+            result,
+            @"\[(#[0-9a-fA-F]{6})\]",
+            "<span class=\"color-swatch\" style=\"background-color:$1\"></span>");
         result = Regex.Replace(result, @"`([^`]+)`", "<code>$1</code>");
         result = Regex.Replace(result, @"\*\*([^*]+)\*\*", "<strong>$1</strong>");
         return result;
     }
 
-    private static string WrapHtml(string body)
+    private static string WrapHtml(string body, string navigation)
     {
         return """
             <!doctype html>
@@ -168,10 +186,19 @@ internal sealed class HelpForm : Form
               <meta charset="utf-8">
               <meta http-equiv="X-UA-Compatible" content="IE=edge">
               <style>
-                body { margin: 0; padding: 28px 36px 60px; font-family: "Segoe UI", Arial, sans-serif; color: #243447; background: #f5f8fa; line-height: 1.55; }
-                main { max-width: 920px; margin: 0 auto; padding: 28px 42px 48px; background: white; border: 1px solid #dce5eb; }
+                * { box-sizing: border-box; }
+                html { scroll-behavior: smooth; }
+                body { margin: 0; font-family: "Segoe UI", Arial, sans-serif; color: #243447; background: #f5f8fa; line-height: 1.55; }
+                nav { position: fixed; z-index: 2; left: 0; top: 0; bottom: 0; width: 260px; padding: 22px 14px 36px; overflow-y: auto; color: white; background: #183f53; border-right: 1px solid #0e3041; }
+                .nav-title { display: block; margin: 0 8px 18px; padding-bottom: 14px; color: white; font-size: 21px; font-weight: 700; text-decoration: none; border-bottom: 2px solid #00a0dc; }
+                nav a { display: block; color: #eaf6fb; text-decoration: none; border-radius: 3px; }
+                nav a:hover, nav a:focus { color: white; background: #0d79a8; }
+                .nav-section { margin-top: 3px; padding: 8px 10px; font-size: 14px; font-weight: 600; }
+                .nav-subsection { padding: 5px 10px 5px 24px; color: #bdd9e5; font-size: 12px; }
+                .content { margin-left: 260px; padding: 28px 36px 60px; }
+                main { max-width: 980px; margin: 0 auto; padding: 30px 44px 56px; background: white; border: 1px solid #dce5eb; box-shadow: 0 2px 10px rgba(32, 70, 88, .08); }
                 h1 { margin: 0 0 24px; padding-bottom: 14px; color: #0078b8; font-size: 32px; border-bottom: 3px solid #00a0dc; }
-                h2 { margin: 34px 0 12px; color: #006da5; font-size: 23px; }
+                h2 { margin: 42px 0 12px; padding-top: 4px; color: #006da5; font-size: 23px; border-top: 1px solid #e5edf1; }
                 h3 { margin: 24px 0 8px; color: #204f68; font-size: 18px; }
                 p { margin: 8px 0 12px; }
                 ul, ol { margin: 8px 0 16px 26px; padding: 0; }
@@ -180,9 +207,15 @@ internal sealed class HelpForm : Form
                 code { padding: 2px 5px; color: #8b1d56; background: #eef3f6; border: 1px solid #dbe4e9; font-family: Consolas, monospace; }
                 pre { padding: 14px; overflow: auto; background: #eef3f6; border-left: 4px solid #00a0dc; }
                 pre code { padding: 0; border: 0; }
+                .color-swatch { display: inline-block; width: 22px; height: 16px; margin: 0 8px -3px 0; border: 1px solid #80919a; border-radius: 2px; }
+                @media (max-width: 760px) {
+                  nav { width: 210px; }
+                  .content { margin-left: 210px; padding: 16px; }
+                  main { padding: 24px; }
+                }
               </style>
             </head>
-            <body><main>
-            """ + body + "</main></body></html>";
+            <body><nav><a class="nav-title" href="#top">Табель СКУД</a>
+            """ + navigation + "</nav><div class=\"content\"><main>" + body + "</main></div></body></html>";
     }
 }
