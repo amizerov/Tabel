@@ -189,17 +189,17 @@ internal sealed class HelpForm : Form
                 * { box-sizing: border-box; }
                 html { scroll-behavior: smooth; }
                 body { margin: 0; font-family: "Segoe UI", Arial, sans-serif; color: #243447; background: #f5f8fa; line-height: 1.55; }
-                nav { position: fixed; z-index: 2; left: 0; top: 0; bottom: 0; width: 260px; padding: 22px 14px 36px; overflow-y: auto; color: white; background: #183f53; border-right: 1px solid #0e3041; }
-                .nav-title { display: block; margin: 0 8px 18px; padding-bottom: 14px; color: white; font-size: 21px; font-weight: 700; text-decoration: none; border-bottom: 2px solid #00a0dc; }
+                nav { position: fixed; z-index: 2; left: 0; top: 0; bottom: 0; width: 320px; padding: 24px 16px 40px; overflow-y: auto; color: white; background: #183f53; border-right: 1px solid #0e3041; }
+                .nav-title { display: block; margin: 0 8px 20px; padding-bottom: 16px; color: white; font-size: 25px; font-weight: 700; text-decoration: none; border-bottom: 2px solid #00a0dc; }
                 nav a { display: block; color: #eaf6fb; text-decoration: none; border-radius: 3px; }
                 nav a:hover, nav a:focus { color: white; background: #0d79a8; }
-                .nav-section { margin-top: 3px; padding: 8px 10px; font-size: 14px; font-weight: 600; }
-                .nav-subsection { padding: 5px 10px 5px 24px; color: #bdd9e5; font-size: 12px; }
-                .content { margin-left: 260px; padding: 28px 36px 60px; }
-                main { max-width: 980px; margin: 0 auto; padding: 30px 44px 56px; background: white; border: 1px solid #dce5eb; box-shadow: 0 2px 10px rgba(32, 70, 88, .08); }
-                h1 { margin: 0 0 24px; padding-bottom: 14px; color: #0078b8; font-size: 32px; border-bottom: 3px solid #00a0dc; }
-                h2 { margin: 42px 0 12px; padding-top: 4px; color: #006da5; font-size: 23px; border-top: 1px solid #e5edf1; }
-                h3 { margin: 24px 0 8px; color: #204f68; font-size: 18px; }
+                .nav-section { margin-top: 5px; padding: 10px 11px; font-size: 17px; line-height: 1.35; font-weight: 600; }
+                .nav-subsection { padding: 7px 10px 7px 27px; color: #bdd9e5; font-size: 15px; line-height: 1.35; }
+                .content { margin-left: 320px; padding: 28px 36px 60px; }
+                main { max-width: 980px; margin: 0 auto; padding: 30px 44px 56px; background: transparent; border: 0; box-shadow: none; }
+                h1 { margin: 0 0 24px; padding-bottom: 14px; color: #0078b8; font-size: 38px; border-bottom: 3px solid #00a0dc; }
+                h2 { margin: 42px 0 14px; padding-top: 6px; color: #006da5; font-size: 29px; border-top: 1px solid #e5edf1; }
+                h3 { margin: 26px 0 10px; color: #204f68; font-size: 23px; }
                 p { margin: 8px 0 12px; }
                 ul, ol { margin: 8px 0 16px 26px; padding: 0; }
                 li { margin: 5px 0; }
@@ -209,8 +209,11 @@ internal sealed class HelpForm : Form
                 pre code { padding: 0; border: 0; }
                 .color-swatch { display: inline-block; width: 22px; height: 16px; margin: 0 8px -3px 0; border: 1px solid #80919a; border-radius: 2px; }
                 @media (max-width: 760px) {
-                  nav { width: 210px; }
-                  .content { margin-left: 210px; padding: 16px; }
+                  nav { width: 250px; }
+                  .nav-title { font-size: 22px; }
+                  .nav-section { font-size: 15px; }
+                  .nav-subsection { font-size: 14px; }
+                  .content { margin-left: 250px; padding: 16px; }
                   main { padding: 24px; }
                 }
               </style>
