@@ -693,7 +693,7 @@ public static class SkudExcelInteropFiller
             {
                 string header = NormalizeHeader(GetValueText(values[row, col]));
 
-                if (header == "фио" || header.Contains("фамилия"))
+                if (IsFioHeader(header))
                 {
                     headerRow = row;
                     return col;
@@ -836,7 +836,7 @@ public static class SkudExcelInteropFiller
 
     private static bool IsServiceRowText(string normalized)
     {
-        return normalized == "фио"
+        return IsFioHeader(normalized)
             || normalized == "итого"
             || normalized == "всего"
             || normalized.StartsWith("итого ")
@@ -973,6 +973,14 @@ public static class SkudExcelInteropFiller
         text = text.Replace('\u00A0', ' ').ToLowerInvariant().Replace('ё', 'е');
         text = Regex.Replace(text, @"\s+", " ");
         return text.Trim();
+    }
+
+    private static bool IsFioHeader(string header)
+    {
+        string normalized = NormalizeHeader(header);
+        string compact = Regex.Replace(normalized, @"[.\s]+", string.Empty);
+
+        return compact == "фио" || normalized.Contains("фамилия", StringComparison.Ordinal);
     }
 
     private static string BuildPersonSearchKey(string fio)
