@@ -17,6 +17,7 @@ public partial class FrmMain : Form
     private string? _compareFilledPath;
     private string? _lastFillerSummary;
     private string? _lastComparatorSummary;
+    private HelpForm? _helpForm;
     private bool _isBusy;
 
     public FrmMain()
@@ -38,6 +39,35 @@ public partial class FrmMain : Form
         SkudExcelInteropFiller.ProgressChanged -= SkudExcelInteropFiller_ProgressChanged;
         SkudTimesheetComparator.ProgressChanged -= SkudTimesheetComparator_ProgressChanged;
         base.OnFormClosed(e);
+    }
+
+    protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
+    {
+        if (keyData == Keys.F1)
+        {
+            ShowHelpWindow();
+            return true;
+        }
+
+        return base.ProcessCmdKey(ref msg, keyData);
+    }
+
+    private void btnHelp_Click(object sender, EventArgs e) => ShowHelpWindow();
+
+    private void ShowHelpWindow()
+    {
+        if (_helpForm == null || _helpForm.IsDisposed)
+        {
+            _helpForm = new HelpForm();
+            _helpForm.FormClosed += (_, _) => _helpForm = null;
+            _helpForm.Show(this);
+            return;
+        }
+
+        if (_helpForm.WindowState == FormWindowState.Minimized)
+            _helpForm.WindowState = FormWindowState.Normal;
+
+        _helpForm.Activate();
     }
 
     private static string GetAppVersion() =>

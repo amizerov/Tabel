@@ -30,6 +30,7 @@ namespace Tabel
             lblFillResultCaption = new Label();
             lblFillResultPath = new Label();
             btnGoToCompare = new Button();
+            btnFillHelp = new Button();
             grpCompareStep = new GroupBox();
             pnlCompareHeader = new Panel();
             lblCompareStepNumber = new Label();
@@ -44,6 +45,7 @@ namespace Tabel
             lblCompareResultCaption = new Label();
             lblCompareResultPath = new Label();
             btnBackToFill = new Button();
+            btnCompareHelp = new Button();
             grpProgress = new GroupBox();
             progressMain = new ProgressBar();
             lblProgressStatus = new Label();
@@ -92,6 +94,7 @@ namespace Tabel
             pnlFillHeader.Controls.Add(lblFillStepNumber);
             pnlFillHeader.Controls.Add(lblFillStepTitle);
             pnlFillHeader.Controls.Add(btnGoToCompare);
+            pnlFillHeader.Controls.Add(btnFillHelp);
             pnlFillHeader.Dock = DockStyle.Top;
             pnlFillHeader.Location = new Point(16, 16);
             pnlFillHeader.Name = "pnlFillHeader";
@@ -219,7 +222,7 @@ namespace Tabel
             btnGoToCompare.BackColor = Color.White;
             btnGoToCompare.Font = new Font("Segoe UI", 8.5F, FontStyle.Bold);
             btnGoToCompare.ForeColor = Color.FromArgb(0, 122, 204);
-            btnGoToCompare.Location = new Point(669, 19);
+            btnGoToCompare.Location = new Point(630, 19);
             btnGoToCompare.Name = "btnGoToCompare";
             btnGoToCompare.Size = new Size(112, 30);
             btnGoToCompare.TabIndex = 9;
@@ -227,6 +230,22 @@ namespace Tabel
             btnGoToCompare.UseVisualStyleBackColor = false;
             btnGoToCompare.Visible = false;
             btnGoToCompare.Click += btnGoToCompare_Click;
+            //
+            // btnFillHelp
+            //
+            btnFillHelp.AccessibleDescription = "Открыть справку (F1)";
+            btnFillHelp.AccessibleName = "Справка";
+            btnFillHelp.Anchor = AnchorStyles.Top | AnchorStyles.Right;
+            btnFillHelp.BackColor = Color.White;
+            btnFillHelp.Font = new Font("Segoe UI", 10F, FontStyle.Bold);
+            btnFillHelp.ForeColor = Color.FromArgb(0, 122, 204);
+            btnFillHelp.Location = new Point(750, 19);
+            btnFillHelp.Name = "btnFillHelp";
+            btnFillHelp.Size = new Size(31, 30);
+            btnFillHelp.TabIndex = 10;
+            btnFillHelp.Text = "?";
+            btnFillHelp.UseVisualStyleBackColor = false;
+            btnFillHelp.Click += btnHelp_Click;
             // 
             // grpCompareStep
             // 
@@ -254,6 +273,7 @@ namespace Tabel
             pnlCompareHeader.Controls.Add(lblCompareStepNumber);
             pnlCompareHeader.Controls.Add(lblCompareStepTitle);
             pnlCompareHeader.Controls.Add(btnBackToFill);
+            pnlCompareHeader.Controls.Add(btnCompareHelp);
             pnlCompareHeader.Dock = DockStyle.Top;
             pnlCompareHeader.Location = new Point(16, 16);
             pnlCompareHeader.Name = "pnlCompareHeader";
@@ -381,13 +401,29 @@ namespace Tabel
             btnBackToFill.BackColor = Color.White;
             btnBackToFill.Font = new Font("Segoe UI", 8.5F, FontStyle.Bold);
             btnBackToFill.ForeColor = Color.FromArgb(0, 122, 204);
-            btnBackToFill.Location = new Point(653, 19);
+            btnBackToFill.Location = new Point(614, 19);
             btnBackToFill.Name = "btnBackToFill";
             btnBackToFill.Size = new Size(128, 30);
             btnBackToFill.TabIndex = 9;
             btnBackToFill.Text = "← Заполнение";
             btnBackToFill.UseVisualStyleBackColor = false;
             btnBackToFill.Click += btnBackToFill_Click;
+            //
+            // btnCompareHelp
+            //
+            btnCompareHelp.AccessibleDescription = "Открыть справку (F1)";
+            btnCompareHelp.AccessibleName = "Справка";
+            btnCompareHelp.Anchor = AnchorStyles.Top | AnchorStyles.Right;
+            btnCompareHelp.BackColor = Color.White;
+            btnCompareHelp.Font = new Font("Segoe UI", 10F, FontStyle.Bold);
+            btnCompareHelp.ForeColor = Color.FromArgb(0, 122, 204);
+            btnCompareHelp.Location = new Point(750, 19);
+            btnCompareHelp.Name = "btnCompareHelp";
+            btnCompareHelp.Size = new Size(31, 30);
+            btnCompareHelp.TabIndex = 10;
+            btnCompareHelp.Text = "?";
+            btnCompareHelp.UseVisualStyleBackColor = false;
+            btnCompareHelp.Click += btnHelp_Click;
             // 
             // grpProgress
             // 
@@ -480,6 +516,7 @@ namespace Tabel
         private Label lblFillResultCaption;
         private Label lblFillResultPath;
         private Button btnGoToCompare;
+        private Button btnFillHelp;
         private Label lblCompareOriginal;
         private TextBox txtCompareOriginal;
         private Button btnSelectCompareOriginal;
@@ -490,6 +527,7 @@ namespace Tabel
         private Label lblCompareResultCaption;
         private Label lblCompareResultPath;
         private Button btnBackToFill;
+        private Button btnCompareHelp;
         private GroupBox grpProgress;
         private ProgressBar progressMain;
         private Label lblProgressStatus;
