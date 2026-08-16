@@ -123,8 +123,9 @@ public static class SkudTimesheetComparator
 
             string summary =
                 $"Сравнение завершено. Проверено сотрудников: {stats.CheckedEmployees}. " +
-                $"Проверено ячеек: {stats.CheckedCells}. Существенных расхождений: {stats.SignificantDifferences}. " +
-                $"Допустимых расхождений: {stats.AllowedDifferences}. Ошибок чтения: {stats.ReadErrors}. Файл: {outputPath}";
+                $"Проверено ячеек: {stats.CheckedCells}. СКУД меньше заявленного: {stats.SkudLowerDifferences}. " +
+                $"СКУД больше заявленного: {stats.SkudHigherDifferences}. Специальных статусов: {stats.SpecialStatuses}. " +
+                $"Ошибок чтения: {stats.ReadErrors}. Файл: {outputPath}";
 
             Report("Завершено", summary, 100, 100, 100, true);
             return outputPath;
@@ -186,7 +187,7 @@ public static class SkudTimesheetComparator
         int totalComparisons = Math.Max(1, originalStructure.DayColumns.Count * Math.Max(1, originalEmployees.Count));
         int currentComparison = 0;
 
-        protocol.Add("ФИО;Дата/день;Табель;СКУД;Разница;Статус");
+        protocol.Add("ФИО;Дата/день;Заявлено;СКУД;Итоговое значение;Разница;Статус");
 
         foreach (var originalEmployee in originalEmployees)
         {
@@ -194,7 +195,7 @@ public static class SkudTimesheetComparator
 
             if (match.Status == MatchStatus.NotFound)
             {
-                protocol.Add($"{originalEmployee.OriginalName};;;;;Строка не найдена в заполненном табеле");
+                protocol.Add($"{originalEmployee.OriginalName};;;;;;Сотрудник не найден в заполненном табеле");
                 stats.ReadErrors++;
                 currentComparison += originalStructure.DayColumns.Count;
                 continue;
@@ -202,7 +203,17 @@ public static class SkudTimesheetComparator
 
             if (match.Status == MatchStatus.Ambiguous)
             {
-                protocol.Add($"{originalEmployee.OriginalName};;;;;Неоднозначное сопоставление строк: {string.Join(", ", match.Candidates.Select(x => x.OriginalName))}");
+                string variants = string.Join(", ", match.Candidates.Select(x => x.OriginalName));
+                try
+                {
+                    dynamic fioCell = outputSheet.Cells[originalEmployee.RowIndex, filledStructure.FioCol];
+                    HighlightCellOrange(fioCell);
+                    AddOrAppendComparisonComment(
+                        fioCell,
+                        $"Неоднозначное сопоставление ФИО. Ключ поиска: {originalEmployee.ShortKey}. Найденные варианты: {variants}.");
+                }
+                catch { }
+                protocol.Add($"{originalEmployee.OriginalName};;;;;;Неоднозначное сопоставление ФИО. Ключ поиска: {originalEmployee.ShortKey}. Найденные варианты: {variants}");
                 stats.ReadErrors++;
                 currentComparison += originalStructure.DayColumns.Count;
                 continue;
@@ -211,6 +222,16 @@ public static class SkudTimesheetComparator
             var filledEmployee = match.Employee!;
             stats.CheckedEmployees++;
 
+            string fioComment = GetCellCommentText(outputSheet.Cells[filledEmployee.RowIndex, filledStructure.FioCol]);
+            if (fioComment.Contains("Неоднозначное сопоставление ФИО", StringComparison.OrdinalIgnoreCase))
+            {
+                try { HighlightCellOrange(outputSheet.Cells[filledEmployee.RowIndex, filledStructure.FioCol]); } catch { }
+                protocol.Add($"{originalEmployee.OriginalName};;;;;;{FlattenForProtocol(fioComment)}");
+                stats.SpecialStatuses++;
+                currentComparison += originalStructure.DayColumns.Count;
+                continue;
+            }
+
             foreach (var pair in originalStructure.DayColumns)
             {
                 DateTime date = pair.Key;
@@ -218,7 +239,7 @@ public static class SkudTimesheetComparator
 
                 if (!filledStructure.DayColumns.TryGetValue(date, out int filledCol))
                 {
-                    protocol.Add($"{originalEmployee.OriginalName};{FormatDateKey(date)};;;;Дневная колонка не найдена в заполненном табеле");
+                    protocol.Add($"{originalEmployee.OriginalName};{FormatDateKey(date)};;;;;Дневная колонка не найдена в заполненном табеле");
                     stats.ReadErrors++;
                     continue;
                 }
@@ -228,8 +249,27 @@ public static class SkudTimesheetComparator
 
                 var originalCell = ReadHourCell(originalValue);
                 var filledCell = ReadHourCell(filledValue);
+                dynamic outputCell = outputSheet.Cells[filledEmployee.RowIndex, filledCol];
+                string outputComment = GetCellCommentText(outputCell);
+                CellSpecialStatus specialStatus = DetectSpecialStatus(outputCell, outputComment);
 
-                if (originalCell.IsEmpty && filledCell.IsEmpty)
+                if (originalCell.IsNumber && specialStatus is CellSpecialStatus.NoAllowedEvents
+                    or CellSpecialStatus.EmployeeNotFound
+                    or CellSpecialStatus.ManualReview)
+                {
+                    stats.CheckedCells++;
+                    stats.SpecialStatuses++;
+                    HandleMissingSkudData(
+                        outputCell,
+                        originalEmployee.OriginalName,
+                        date,
+                        originalCell.Value,
+                        specialStatus,
+                        outputComment,
+                        protocol);
+                }
+
+                else if (originalCell.IsEmpty && filledCell.IsEmpty)
                 {
                 }
                 else if (originalCell.IsNumber && filledCell.IsNumber)
@@ -243,6 +283,7 @@ public static class SkudTimesheetComparator
                         date,
                         originalCell.Value,
                         filledCell.Value,
+                        specialStatus,
                         protocol,
                         stats);
                 }
@@ -260,13 +301,14 @@ public static class SkudTimesheetComparator
                         date,
                         originalHours,
                         filledHours,
+                        specialStatus,
                         protocol,
                         stats);
                 }
                 else
                 {
                     stats.ReadErrors++;
-                    protocol.Add($"{originalEmployee.OriginalName};{FormatDateKey(date)};Табель={originalCell.Text};СКУД={filledCell.Text};;Ошибка чтения / ручная проверка");
+                    protocol.Add($"{originalEmployee.OriginalName};{FormatDateKey(date)};{originalCell.Text};{filledCell.Text};;;Ошибка чтения / ручная проверка");
                 }
 
                 currentComparison++;
@@ -276,6 +318,14 @@ public static class SkudTimesheetComparator
                     Report("Сравнение табелей", $"Сравнено ячеек: {currentComparison} из {totalComparisons}", currentComparison, totalComparisons, percent);
                 }
             }
+
+            RecalculateOutputTotal(
+                outputSheet,
+                filledEmployee.RowIndex,
+                filledStructure,
+                originalEmployee.OriginalName,
+                protocol,
+                stats);
         }
 
         return stats;
@@ -289,34 +339,101 @@ public static class SkudTimesheetComparator
         DateTime date,
         double originalHours,
         double filledHours,
+        CellSpecialStatus specialStatus,
         List<string> protocol,
         ComparisonStats stats)
     {
-        // Разница как исходный - заполненный (signed). При любых допустимых расхождениях — выделяем и комментируем.
-        double difference = originalHours - filledHours;
+        dynamic cell = outputSheet.Cells[outputRow, outputCol];
+        double difference = filledHours - originalHours;
+        string declared = FormatNumber(originalHours);
+        string skud = FormatNumber(filledHours);
+        bool isSingleAllowedEvent = specialStatus == CellSpecialStatus.SingleAllowedEvent;
+
+        if (isSingleAllowedEvent)
+        {
+            stats.SpecialStatuses++;
+            try { HighlightCellBlue(cell); } catch { }
+            string singleComment = Math.Abs(filledHours - 2) < 1e-9
+                ? "За день найдена только одна разрешённая отметка СКУД. Установлено 2 часа."
+                : $"За день найдена только одна разрешённая отметка СКУД. Расчёт выполнен по правилу для одной отметки. По СКУД: {skud} ч.";
+            try { AddOrAppendComparisonComment(cell, singleComment); } catch { }
+        }
 
         if (Math.Abs(difference) < 1e-9)
-            return; // совпадает
-
-        double absDiff = Math.Abs(difference);
-
-        // Любая разница до и включая 1 часа считаем допустимой и подсвечиваем (восстановление поведения до ранних версий)
-        if (absDiff <= 1.0)
         {
-            stats.AllowedDifferences++;
-            try { HighlightCellGreen(outputSheet.Cells[outputRow, outputCol]); } catch { }
-            string comment = $"Исходный табель: {FormatNumber(originalHours)}. Заполненный табель: {FormatNumber(filledHours)}. Разница: {FormatNumber(absDiff)} час(а/ов)";
-            try { AddOrAppendComparisonComment(outputSheet.Cells[outputRow, outputCol], comment); } catch { }
-            protocol.Add($"{fio};{FormatDateKey(date)};Табель={originalHours};СКУД={filledHours};Разница={absDiff};Допустимое расхождение");
+            if (!isSingleAllowedEvent)
+                try { ClearCellFill(cell); } catch { }
+
+            protocol.Add($"{fio};{FormatDateKey(date)};{declared};{skud};{skud};0;" +
+                (isSingleAllowedEvent ? "Одна разрешённая отметка СКУД" : "Совпадает"));
             return;
         }
 
-        // Существенное расхождение
-        stats.SignificantDifferences++;
-        try { HighlightCellYellow(outputSheet.Cells[outputRow, outputCol]); } catch { }
-        string bigComment = $"Исходный табель: {FormatNumber(originalHours)}. Заполненный табель: {FormatNumber(filledHours)}. Разница: {FormatNumber(absDiff)} час(а/ов)";
-        try { AddOrAppendComparisonComment(outputSheet.Cells[outputRow, outputCol], bigComment); } catch { }
-        protocol.Add($"{fio};{FormatDateKey(date)};Табель={originalHours};СКУД={filledHours};Разница={absDiff};Существенное расхождение");
+        if (difference > 0)
+        {
+            stats.SkudHigherDifferences++;
+            cell.Value2 = originalHours;
+            if (!isSingleAllowedEvent)
+                try { ClearCellFill(cell); } catch { }
+
+            string comment = $"Заявлено: {declared} ч. По СКУД: {skud} ч. Фактическое время по СКУД превышает заявленное. " +
+                $"В табеле оставлено заявленное значение: {declared} ч.";
+            try { AddOrAppendComparisonComment(cell, comment); } catch { }
+            protocol.Add($"{fio};{FormatDateKey(date)};{declared};{skud};{declared};{FormatNumber(difference)};" +
+                (isSingleAllowedEvent ? "Одна разрешённая отметка СКУД" : "СКУД больше заявленного — оставлены заявленные часы"));
+            return;
+        }
+
+        stats.SkudLowerDifferences++;
+        if (!isSingleAllowedEvent)
+            try { HighlightCellYellow(cell); } catch { }
+
+        double shortage = originalHours - filledHours;
+        string lowerComment = $"Заявлено: {declared} ч. По СКУД: {skud} ч. Фактическое время по СКУД меньше заявленного на {FormatNumber(shortage)} ч.";
+        try { AddOrAppendComparisonComment(cell, lowerComment); } catch { }
+        protocol.Add($"{fio};{FormatDateKey(date)};{declared};{skud};{skud};{FormatNumber(shortage)};" +
+            (isSingleAllowedEvent ? "Одна разрешённая отметка СКУД" : "СКУД меньше заявленного"));
+    }
+
+    private static void RecalculateOutputTotal(
+        dynamic sheet,
+        int row,
+        TimesheetStructure structure,
+        string fio,
+        List<string> protocol,
+        ComparisonStats stats)
+    {
+        if (!structure.TotalHoursCol.HasValue)
+            return;
+
+        try
+        {
+            double total = 0;
+            foreach (int col in structure.DayColumns.Values.Distinct())
+            {
+                object value = sheet.Cells[row, col].Value2;
+                if (TryConvertToDouble(value, out double hours))
+                    total += hours;
+            }
+
+            dynamic totalCell = sheet.Cells[row, structure.TotalHoursCol.Value];
+            try
+            {
+                if (totalCell.HasFormula == true)
+                {
+                    totalCell.Calculate();
+                    return;
+                }
+            }
+            catch { }
+
+            totalCell.Value2 = total;
+        }
+        catch (Exception ex)
+        {
+            stats.ReadErrors++;
+            protocol.Add($"{fio};;;;;;Не удалось пересчитать итоговую колонку: {FlattenForProtocol(ex.Message)}");
+        }
     }
 
     private static dynamic FindWorksheetWithTimesheet(dynamic workbook, out TimesheetStructure structure)
@@ -817,9 +934,110 @@ public static class SkudTimesheetComparator
         try { cell.Interior.Color = RGB(255, 255, 0); } catch { }
     }
 
-    private static void HighlightCellGreen(dynamic cell)
+    private static void HighlightCellBlue(dynamic cell)
     {
-        try { cell.Interior.Color = RGB(198, 239, 206); } catch { }
+        try { cell.Interior.Color = RGB(189, 215, 238); } catch { }
+    }
+
+    private static void HighlightCellRed(dynamic cell)
+    {
+        try { cell.Interior.Color = RGB(255, 199, 206); } catch { }
+    }
+
+    private static void HighlightCellOrange(dynamic cell)
+    {
+        try { cell.Interior.Color = RGB(255, 165, 0); } catch { }
+    }
+
+    private static void ClearCellFill(dynamic cell)
+    {
+        try { cell.Interior.Pattern = -4142; } catch { }
+    }
+
+    private static string GetCellCommentText(dynamic cell)
+    {
+        try
+        {
+            var comment = cell.Comment;
+            return comment == null
+                ? string.Empty
+                : Convert.ToString(comment.Text())?.Trim() ?? string.Empty;
+        }
+        catch
+        {
+            return string.Empty;
+        }
+    }
+
+    private static string FlattenForProtocol(string value)
+    {
+        return Regex.Replace(value ?? string.Empty, @"\s+", " ").Trim();
+    }
+
+    private static CellSpecialStatus DetectSpecialStatus(dynamic cell, string comment)
+    {
+        if (comment.Contains("сотрудник не найден в данных СКУД", StringComparison.OrdinalIgnoreCase))
+            return CellSpecialStatus.EmployeeNotFound;
+
+        if (comment.Contains("разрешённые отметки в СКУД отсутствуют", StringComparison.OrdinalIgnoreCase))
+            return CellSpecialStatus.NoAllowedEvents;
+
+        if (comment.Contains("Одна запись СКУД за день", StringComparison.OrdinalIgnoreCase)
+            || comment.Contains("только одна разрешённая отметка СКУД", StringComparison.OrdinalIgnoreCase))
+            return CellSpecialStatus.SingleAllowedEvent;
+
+        if (HasCellColor(cell, RGB(255, 199, 206)))
+            return CellSpecialStatus.ManualReview;
+
+        if (HasCellColor(cell, RGB(189, 215, 238)))
+            return CellSpecialStatus.SingleAllowedEvent;
+
+        return CellSpecialStatus.None;
+    }
+
+    private static bool HasCellColor(dynamic cell, int expectedColor)
+    {
+        try { return Convert.ToInt32(cell.Interior.Color, CultureInfo.InvariantCulture) == expectedColor; }
+        catch { return false; }
+    }
+
+    private static void HandleMissingSkudData(
+        dynamic cell,
+        string fio,
+        DateTime date,
+        double declaredHours,
+        CellSpecialStatus status,
+        string existingComment,
+        List<string> protocol)
+    {
+        string declared = FormatNumber(declaredHours);
+        string comparisonComment;
+        string protocolStatus;
+
+        if (status == CellSpecialStatus.EmployeeNotFound)
+        {
+            comparisonComment = "Смена заявлена, сотрудник не найден в данных СКУД.";
+            protocolStatus = "Сотрудник не найден в СКУД";
+        }
+        else if (status == CellSpecialStatus.NoAllowedEvents)
+        {
+            comparisonComment = $"Смена заявлена на {declared} часов, но разрешённые отметки в СКУД отсутствуют.";
+            protocolStatus = "Разрешённые отметки СКУД отсутствуют";
+        }
+        else
+        {
+            comparisonComment = string.IsNullOrWhiteSpace(existingComment)
+                ? "Требуется ручная проверка данных СКУД."
+                : $"Специальный статус сохранён: {FlattenForProtocol(existingComment)}";
+            protocolStatus = string.IsNullOrWhiteSpace(existingComment)
+                ? "Ручная проверка данных СКУД"
+                : FlattenForProtocol(existingComment);
+        }
+
+        try { HighlightCellRed(cell); } catch { }
+        try { AddOrAppendComparisonComment(cell, comparisonComment); } catch { }
+        string finalValue = status == CellSpecialStatus.ManualReview ? declared : string.Empty;
+        protocol.Add($"{fio};{FormatDateKey(date)};{declared};;{finalValue};;{protocolStatus}");
     }
 
     private static void AddCommentSafe(dynamic cell, string commentText)
@@ -935,6 +1153,15 @@ public static class SkudTimesheetComparator
         Ambiguous
     }
 
+    private enum CellSpecialStatus
+    {
+        None,
+        SingleAllowedEvent,
+        NoAllowedEvents,
+        EmployeeNotFound,
+        ManualReview
+    }
+
     private sealed class RowMatch
     {
         public MatchStatus Status { get; private init; }
@@ -985,8 +1212,9 @@ public static class SkudTimesheetComparator
     {
         public int CheckedEmployees { get; set; }
         public int CheckedCells { get; set; }
-        public int SignificantDifferences { get; set; }
-        public int AllowedDifferences { get; set; }
+        public int SkudLowerDifferences { get; set; }
+        public int SkudHigherDifferences { get; set; }
+        public int SpecialStatuses { get; set; }
         public int ReadErrors { get; set; }
     }
 }
