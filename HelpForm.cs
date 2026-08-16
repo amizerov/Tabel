@@ -27,6 +27,12 @@ internal sealed class HelpForm : Form
         tabs.TabPages.Add(CreateDocumentPage(
             "Тех. задание",
             LoadDocumentHtml("ТЗ.md", "Техническое задание", "ТЗ недоступно")));
+        tabs.TabPages.Add(CreateDocumentPage(
+            "Отличия",
+            LoadDocumentHtml("ТЗ_Diff.md", "Отличия от технического задания", "Описание отличий недоступно")));
+        tabs.TabPages.Add(CreateDocumentPage(
+            "ChangeLog",
+            LoadDocumentHtml("ChangeLog.md", "История изменений", "История изменений недоступна")));
 
         Controls.Add(tabs);
         WindowStateStore.Attach(this, "Help");
@@ -84,6 +90,9 @@ internal sealed class HelpForm : Form
         bool inUnorderedList = false;
         bool inOrderedList = false;
         bool inCodeBlock = false;
+        bool hasDocumentTitle = false;
+        bool hasContentHeading = false;
+        bool insideLevelOneSection = false;
         int sectionNumber = 0;
 
         void CloseLists()
@@ -131,12 +140,33 @@ internal sealed class HelpForm : Form
                 CloseLists();
                 int level = heading.Groups[1].Value.Length;
                 string headingText = heading.Groups[2].Value;
-                string id = level == 1 ? "top" : $"section-{++sectionNumber}";
+                bool isDocumentTitle = level == 1 && !hasDocumentTitle;
+                bool isDocumentSubtitle = level == 1 && hasDocumentTitle && !hasContentHeading;
+                string id = isDocumentTitle ? "top" : $"section-{++sectionNumber}";
                 body.AppendLine($"<h{level} id=\"{id}\">{FormatInline(headingText)}</h{level}>");
 
-                if (level is 2 or 3)
+                if (isDocumentTitle)
                 {
-                    string cssClass = level == 2 ? "nav-section" : "nav-subsection";
+                    hasDocumentTitle = true;
+                    insideLevelOneSection = false;
+                }
+                else if (isDocumentSubtitle)
+                {
+                    insideLevelOneSection = false;
+                }
+                else if (level == 1)
+                {
+                    hasContentHeading = true;
+                    insideLevelOneSection = true;
+                    navigation.AppendLine(
+                        $"<a class=\"nav-section\" href=\"#{id}\">{WebUtility.HtmlEncode(headingText)}</a>");
+                }
+                else if (level is 2 or 3)
+                {
+                    hasContentHeading = true;
+                    string cssClass = level == 2 && !insideLevelOneSection
+                        ? "nav-section"
+                        : "nav-subsection";
                     navigation.AppendLine(
                         $"<a class=\"{cssClass}\" href=\"#{id}\">{WebUtility.HtmlEncode(headingText)}</a>");
                 }
