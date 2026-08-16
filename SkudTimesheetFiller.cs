@@ -29,11 +29,160 @@ internal sealed class PersonSearchInfo
 
 public static class SkudExcelInteropFiller
 {
+    private enum InputFileExpectation
+    {
+        OriginalTimesheet,
+        FilledTimesheet,
+        SkudExport
+    }
+
     public static event EventHandler<SkudProgressEventArgs>? ProgressChanged;
 
     public static Task<string> FillTimesheetAsync(string timesheetPath, string skudPath)
     {
         return RunStaTask(() => FillTimesheetFile(timesheetPath, skudPath));
+    }
+
+    public static Task ValidateOriginalTimesheetInputAsync(string path)
+    {
+        return RunStaTask(() =>
+        {
+            ValidateInputFile(path, InputFileExpectation.OriginalTimesheet);
+            return true;
+        });
+    }
+
+    public static Task ValidateFilledTimesheetInputAsync(string path)
+    {
+        return RunStaTask(() =>
+        {
+            ValidateInputFile(path, InputFileExpectation.FilledTimesheet);
+            return true;
+        });
+    }
+
+    public static Task ValidateSkudInputAsync(string path)
+    {
+        return RunStaTask(() =>
+        {
+            ValidateInputFile(path, InputFileExpectation.SkudExport);
+            return true;
+        });
+    }
+
+    private static void ValidateInputFile(string path, InputFileExpectation expectation)
+    {
+        if (!File.Exists(path))
+            throw new FileNotFoundException("Выбранный файл не найден.", path);
+
+        if (!string.Equals(Path.GetExtension(path), ".xlsx", StringComparison.OrdinalIgnoreCase))
+            throw new Exception("Поддерживаются только Excel-файлы формата .xlsx.");
+
+        Type? excelType = Type.GetTypeFromProgID("Excel.Application");
+        if (excelType == null)
+            throw new Exception("Microsoft Excel не установлен или COM-объект Excel.Application недоступен.");
+
+        dynamic? excel = null;
+        dynamic? workbook = null;
+        dynamic? timesheetSheet = null;
+
+        try
+        {
+            excel = Activator.CreateInstance(excelType);
+            excel.Visible = false;
+            excel.DisplayAlerts = false;
+            workbook = excel.Workbooks.Open(path, 0, true);
+
+            if (expectation == InputFileExpectation.SkudExport)
+            {
+                ValidateSkudColumns(workbook);
+            }
+            else
+            {
+                string workbookRole = TabelWorkbookMetadata.GetExplicitRole(workbook);
+                ValidateWorkbookRole(workbookRole, expectation);
+                var protocol = new ProcessingProtocol();
+
+                timesheetSheet = FindTimesheetWorksheet(
+                    workbook,
+                    new DateTime(2000, 1, 1),
+                    protocol,
+                    out TimesheetStructure _);
+
+                ReleaseComObject(timesheetSheet);
+                timesheetSheet = null;
+
+                if (string.IsNullOrWhiteSpace(workbookRole)
+                    && TabelWorkbookMetadata.IsLegacyComparison(workbook))
+                    throw new Exception("Эта книга определена как старый файл результата сравнения по комментариям или цветовой разметке и не может использоваться как входной файл.");
+            }
+        }
+        finally
+        {
+            if (timesheetSheet != null)
+                ReleaseComObject(timesheetSheet);
+
+            try { if (workbook != null) workbook.Close(false); } catch { }
+            if (workbook != null)
+                ReleaseComObject(workbook);
+
+            if (excel != null)
+            {
+                try { excel.Quit(); } catch { }
+                ReleaseComObject(excel);
+            }
+
+            GC.Collect();
+            GC.WaitForPendingFinalizers();
+            GC.Collect();
+            GC.WaitForPendingFinalizers();
+        }
+    }
+
+    private static void ValidateSkudColumns(dynamic workbook)
+    {
+        int sheetCount = workbook.Worksheets.Count;
+
+        for (int sheetIndex = 1; sheetIndex <= sheetCount; sheetIndex++)
+        {
+            dynamic? sheet = null;
+            dynamic? usedRange = null;
+
+            try
+            {
+                sheet = workbook.Worksheets[sheetIndex];
+                usedRange = sheet.UsedRange;
+                object[,] values = ToArray2D(usedRange.Value2);
+                int usedRows = usedRange.Rows.Count;
+                int usedCols = usedRange.Columns.Count;
+
+                if (TryFindSkudColumns(values, usedRows, usedCols, out _, out _, out _, out _))
+                    return;
+            }
+            finally
+            {
+                if (usedRange != null)
+                    ReleaseComObject(usedRange);
+                if (sheet != null)
+                    ReleaseComObject(sheet);
+            }
+        }
+
+        throw new Exception("Не найдены обязательные колонки СКУД: Дата записи, Персона, Сообщение.");
+    }
+
+    private static void ValidateWorkbookRole(string workbookRole, InputFileExpectation expectation)
+    {
+        if (string.IsNullOrWhiteSpace(workbookRole))
+            return;
+
+        if (string.Equals(workbookRole, TabelWorkbookMetadata.ComparisonRole, StringComparison.OrdinalIgnoreCase))
+            throw new Exception("Эта книга помечена как файл результата сравнения и не может использоваться как входной файл.");
+
+        if (expectation == InputFileExpectation.OriginalTimesheet
+            && string.Equals(workbookRole, TabelWorkbookMetadata.FilledTimesheetRole, StringComparison.OrdinalIgnoreCase))
+            throw new Exception("Эта книга помечена как заполненный табель и не может использоваться как исходный табель подрядчика.");
+
     }
 
     public static string FillTimesheetFile(string timesheetPath, string skudPath)
@@ -100,6 +249,7 @@ public static class SkudExcelInteropFiller
             var fillResult = FillTimesheet(outputBook, skudRead.EventsByPerson, skudRead.MainMonth, skudRead.Months, protocol);
 
             Report("Сохранение", "Сохраняю заполненный табель...", 0, 100, 95);
+            TabelWorkbookMetadata.SetRole(outputBook, TabelWorkbookMetadata.FilledTimesheetRole);
             outputBook.Save();
             outputBook.Close(false);
             ReleaseComObject(outputBook);

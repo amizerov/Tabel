@@ -114,6 +114,7 @@ public static class SkudTimesheetComparator
                 protocol);
 
             Report("Сохранение", "Сохраняю файл сравнения...", 0, 100, 95);
+            TabelWorkbookMetadata.SetRole(outputBook, TabelWorkbookMetadata.ComparisonRole);
             outputBook.Save();
             outputBook.Close(false);
             ReleaseComObject(outputBook);
