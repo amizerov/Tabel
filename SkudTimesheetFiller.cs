@@ -880,32 +880,58 @@ public static class SkudExcelInteropFiller
             return result;
         }
 
+        List<string>? shortKeyCandidates = null;
+
         if (!string.IsNullOrWhiteSpace(searchKey) && personKeyIndex.TryGetValue(searchKey, out var keys))
         {
             var uniqueKeys = keys.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+            shortKeyCandidates = uniqueKeys;
 
             if (uniqueKeys.Count == 1)
             {
                 string candidate = uniqueKeys[0];
 
-                if (!IsSafeShortKeyMatch(fioFromTimesheet, candidate))
+                if (IsSafeShortKeyMatch(fioFromTimesheet, candidate))
                 {
-                    result.Status = PersonSearchResult.AmbiguousFound;
-                    result.StatusText = "сомнительное совпадение по краткому ключу";
-                    result.FoundVariants.Add($"{candidate}; причина=совпал только краткий ключ, но полные имена различаются");
+                    result.Status = PersonSearchResult.Found;
+                    result.PersonKey = candidate;
+                    result.StatusText = "найден по краткому ключу";
+                    result.FoundVariants.Add(candidate);
                     return result;
                 }
-
-                result.Status = PersonSearchResult.Found;
-                result.PersonKey = candidate;
-                result.StatusText = "найден по краткому ключу";
-                result.FoundVariants.Add(candidate);
-                return result;
             }
+        }
 
+        FuzzyMatchResult<string> fuzzy = FioFuzzyMatcher.Find(
+            normalizedFio,
+            eventsByPerson.Keys,
+            candidate => candidate);
+
+        if (fuzzy.Status == FuzzyMatchStatus.Found)
+        {
+            string candidate = fuzzy.Match!;
+            result.Status = PersonSearchResult.Found;
+            result.PersonKey = candidate;
+            result.StatusText = $"найден по нечёткому совпадению: расстояние {fuzzy.Distance}, отличие {fuzzy.DifferencePercent:0.#}%";
+            result.FoundVariants.Add(candidate);
+            return result;
+        }
+
+        if (fuzzy.Status == FuzzyMatchStatus.Ambiguous)
+        {
             result.Status = PersonSearchResult.AmbiguousFound;
-            result.StatusText = "неоднозначно";
-            result.FoundVariants = uniqueKeys;
+            result.StatusText = $"неоднозначное нечёткое совпадение: расстояние {fuzzy.Distance}";
+            result.FoundVariants = fuzzy.Candidates.ToList();
+            return result;
+        }
+
+        if (shortKeyCandidates != null)
+        {
+            result.Status = PersonSearchResult.AmbiguousFound;
+            result.StatusText = shortKeyCandidates.Count == 1
+                ? "сомнительное совпадение по краткому ключу"
+                : "неоднозначно";
+            result.FoundVariants = shortKeyCandidates;
             return result;
         }
 

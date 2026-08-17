@@ -783,6 +783,25 @@ public static class SkudTimesheetComparator
 
         if (!string.IsNullOrWhiteSpace(originalEmployee.ShortKey)
             && filledIndex.ByShortKey.TryGetValue(originalEmployee.ShortKey, out var shortMatches))
+        {
+            RowMatch shortMatch = BuildRowMatch(shortMatches);
+            if (shortMatch.Status == MatchStatus.Found)
+                return shortMatch;
+        }
+
+        var fuzzy = FioFuzzyMatcher.Find(
+            originalEmployee.NormalizedName,
+            filledIndex.ByFullName.Values.SelectMany(x => x).GroupBy(x => x.RowIndex).Select(x => x.First()),
+            candidate => candidate.NormalizedName);
+
+        if (fuzzy.Status == FuzzyMatchStatus.Found)
+            return RowMatch.Found(fuzzy.Match!);
+
+        if (fuzzy.Status == FuzzyMatchStatus.Ambiguous)
+            return RowMatch.Ambiguous(fuzzy.Candidates.ToList());
+
+        if (!string.IsNullOrWhiteSpace(originalEmployee.ShortKey)
+            && filledIndex.ByShortKey.TryGetValue(originalEmployee.ShortKey, out shortMatches))
             return BuildRowMatch(shortMatches);
 
         return RowMatch.NotFound();
