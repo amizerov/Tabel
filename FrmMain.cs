@@ -39,6 +39,7 @@ public partial class FrmMain : Form
     {
         SkudExcelInteropFiller.ProgressChanged -= SkudExcelInteropFiller_ProgressChanged;
         SkudTimesheetComparator.ProgressChanged -= SkudTimesheetComparator_ProgressChanged;
+        SkudExcelInteropFiller.ShutdownValidationSession();
         base.OnFormClosed(e);
     }
 

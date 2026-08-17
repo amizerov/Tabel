@@ -102,30 +102,9 @@ internal static class TabelWorkbookMetadata
                 }
 
                 usedRange = sheet.UsedRange;
-                int firstRow = usedRange.Row;
-                int firstColumn = usedRange.Column;
-                int rowCount = usedRange.Rows.Count;
-                int columnCount = usedRange.Columns.Count;
-
-                for (int row = firstRow; row < firstRow + rowCount; row++)
-                {
-                    for (int column = firstColumn; column < firstColumn + columnCount; column++)
-                    {
-                        dynamic? cell = null;
-                        try
-                        {
-                            cell = sheet.Cells[row, column];
-                            int color = Convert.ToInt32(cell.Interior.Color);
-                            if (color == RGB(255, 255, 0) || color == RGB(198, 239, 206))
-                                return true;
-                        }
-                        catch { }
-                        finally
-                        {
-                            ReleaseComObject(cell);
-                        }
-                    }
-                }
+                if (RangeContainsColor(workbook.Application, usedRange, RGB(255, 255, 0))
+                    || RangeContainsColor(workbook.Application, usedRange, RGB(198, 239, 206)))
+                    return true;
             }
             catch { }
             finally
@@ -137,6 +116,37 @@ internal static class TabelWorkbookMetadata
         }
 
         return false;
+    }
+
+    private static bool RangeContainsColor(dynamic application, dynamic range, int color)
+    {
+        dynamic? found = null;
+
+        try
+        {
+            application.FindFormat.Clear();
+            application.FindFormat.Interior.Color = color;
+            found = range.Find(
+                "*",
+                Type.Missing,
+                -4163, // xlValues
+                2,     // xlPart
+                1,     // xlByRows
+                1,     // xlNext
+                false,
+                Type.Missing,
+                true); // SearchFormat
+            return found != null;
+        }
+        catch
+        {
+            return false;
+        }
+        finally
+        {
+            ReleaseComObject(found);
+            try { application.FindFormat.Clear(); } catch { }
+        }
     }
 
     private static int RGB(int red, int green, int blue)

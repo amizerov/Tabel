@@ -1,6 +1,7 @@
 namespace Tabel;
 
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
@@ -29,6 +30,8 @@ internal sealed class PersonSearchInfo
 
 public static class SkudExcelInteropFiller
 {
+    private const double MaxDeclaredShiftHours = 23d;
+
     private enum InputFileExpectation
     {
         OriginalTimesheet,
@@ -45,32 +48,28 @@ public static class SkudExcelInteropFiller
 
     public static Task ValidateOriginalTimesheetInputAsync(string path)
     {
-        return RunStaTask(() =>
-        {
-            ValidateInputFile(path, InputFileExpectation.OriginalTimesheet);
-            return true;
-        });
+        return ValidationWorker.Instance.ValidateAsync(path, InputFileExpectation.OriginalTimesheet);
     }
 
     public static Task ValidateFilledTimesheetInputAsync(string path)
     {
-        return RunStaTask(() =>
-        {
-            ValidateInputFile(path, InputFileExpectation.FilledTimesheet);
-            return true;
-        });
+        return ValidationWorker.Instance.ValidateAsync(path, InputFileExpectation.FilledTimesheet);
     }
 
     public static Task ValidateSkudInputAsync(string path)
     {
-        return RunStaTask(() =>
-        {
-            ValidateInputFile(path, InputFileExpectation.SkudExport);
-            return true;
-        });
+        return ValidationWorker.Instance.ValidateAsync(path, InputFileExpectation.SkudExport);
     }
 
-    private static void ValidateInputFile(string path, InputFileExpectation expectation)
+    public static void ShutdownValidationSession()
+    {
+        ValidationWorker.Shutdown();
+    }
+
+    private static void ValidateInputFile(
+        string path,
+        InputFileExpectation expectation,
+        dynamic excel)
     {
         if (!File.Exists(path))
             throw new FileNotFoundException("Выбранный файл не найден.", path);
@@ -78,19 +77,11 @@ public static class SkudExcelInteropFiller
         if (!string.Equals(Path.GetExtension(path), ".xlsx", StringComparison.OrdinalIgnoreCase))
             throw new Exception("Поддерживаются только Excel-файлы формата .xlsx.");
 
-        Type? excelType = Type.GetTypeFromProgID("Excel.Application");
-        if (excelType == null)
-            throw new Exception("Microsoft Excel не установлен или COM-объект Excel.Application недоступен.");
-
-        dynamic? excel = null;
         dynamic? workbook = null;
         dynamic? timesheetSheet = null;
 
         try
         {
-            excel = Activator.CreateInstance(excelType);
-            excel.Visible = false;
-            excel.DisplayAlerts = false;
             workbook = excel.Workbooks.Open(path, 0, true);
 
             if (expectation == InputFileExpectation.SkudExport)
@@ -107,7 +98,9 @@ public static class SkudExcelInteropFiller
                     workbook,
                     new DateTime(2000, 1, 1),
                     protocol,
-                    out TimesheetStructure _);
+                    out TimesheetStructure _,
+                    maxRows: 1000,
+                    maxColumns: 512);
 
                 ReleaseComObject(timesheetSheet);
                 timesheetSheet = null;
@@ -126,16 +119,137 @@ public static class SkudExcelInteropFiller
             if (workbook != null)
                 ReleaseComObject(workbook);
 
-            if (excel != null)
+        }
+    }
+
+    private sealed class ValidationWorker : IDisposable
+    {
+        private sealed record Request(
+            string Path,
+            InputFileExpectation Expectation,
+            TaskCompletionSource<bool> Completion);
+
+        private sealed record CacheEntry(long Length, DateTime LastWriteTimeUtc);
+
+        private static readonly object SyncRoot = new();
+        private static ValidationWorker? _instance;
+
+        private readonly BlockingCollection<Request> _requests = new();
+        private readonly Dictionary<(string Path, InputFileExpectation Expectation), CacheEntry> _cache = new();
+        private readonly Thread _thread;
+        private bool _disposed;
+
+        public static ValidationWorker Instance
+        {
+            get
             {
-                try { excel.Quit(); } catch { }
-                ReleaseComObject(excel);
+                lock (SyncRoot)
+                    return _instance ??= new ValidationWorker();
+            }
+        }
+
+        private ValidationWorker()
+        {
+            _thread = new Thread(ProcessRequests)
+            {
+                IsBackground = true,
+                Name = "Tabel Excel validation"
+            };
+            _thread.SetApartmentState(ApartmentState.STA);
+            _thread.Start();
+        }
+
+        public Task ValidateAsync(string path, InputFileExpectation expectation)
+        {
+            if (_disposed)
+                throw new ObjectDisposedException(nameof(ValidationWorker));
+
+            var completion = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            _requests.Add(new Request(path, expectation, completion));
+            return completion.Task;
+        }
+
+        public static void Shutdown()
+        {
+            ValidationWorker? worker;
+
+            lock (SyncRoot)
+            {
+                worker = _instance;
+                _instance = null;
             }
 
-            GC.Collect();
-            GC.WaitForPendingFinalizers();
-            GC.Collect();
-            GC.WaitForPendingFinalizers();
+            worker?.Dispose();
+        }
+
+        private void ProcessRequests()
+        {
+            dynamic? excel = null;
+
+            try
+            {
+                foreach (Request request in _requests.GetConsumingEnumerable())
+                {
+                    try
+                    {
+                        var file = new FileInfo(request.Path);
+                        var key = (Path.GetFullPath(request.Path), request.Expectation);
+                        var stamp = new CacheEntry(file.Length, file.LastWriteTimeUtc);
+
+                        if (!_cache.TryGetValue(key, out CacheEntry? cached) || cached != stamp)
+                        {
+                            excel ??= CreateValidationExcel();
+                            ValidateInputFile(request.Path, request.Expectation, excel);
+                            _cache[key] = stamp;
+                        }
+
+                        request.Completion.TrySetResult(true);
+                    }
+                    catch (Exception ex)
+                    {
+                        request.Completion.TrySetException(ex);
+                    }
+                }
+            }
+            finally
+            {
+                if (excel != null)
+                {
+                    try { excel.Quit(); } catch { }
+                    ReleaseComObject(excel);
+                }
+            }
+        }
+
+        private static dynamic CreateValidationExcel()
+        {
+            Type? excelType = Type.GetTypeFromProgID("Excel.Application");
+            if (excelType == null)
+                throw new Exception("Microsoft Excel не установлен или COM-объект Excel.Application недоступен.");
+
+            dynamic excel = Activator.CreateInstance(excelType)
+                ?? throw new Exception("Не удалось запустить Microsoft Excel.");
+            excel.Visible = false;
+            excel.DisplayAlerts = false;
+            excel.ScreenUpdating = false;
+            excel.EnableEvents = false;
+            try { excel.Calculation = -4135; } catch { }
+            try { excel.AskToUpdateLinks = false; } catch { }
+            return excel;
+        }
+
+        public void Dispose()
+        {
+            if (_disposed)
+                return;
+
+            _disposed = true;
+            _requests.CompleteAdding();
+
+            if (Thread.CurrentThread != _thread)
+                _thread.Join(TimeSpan.FromSeconds(10));
+
+            _requests.Dispose();
         }
     }
 
@@ -151,10 +265,10 @@ public static class SkudExcelInteropFiller
             try
             {
                 sheet = workbook.Worksheets[sheetIndex];
-                usedRange = sheet.UsedRange;
-                object[,] values = ToArray2D(usedRange.Value2);
-                int usedRows = usedRange.Rows.Count;
-                int usedCols = usedRange.Columns.Count;
+                ExcelWorksheetData data = ExcelWorksheetReader.Read(sheet, maxRows: 50, maxColumns: 512);
+                object[,] values = data.Values;
+                int usedRows = data.Rows;
+                int usedCols = data.Columns;
 
                 if (TryFindSkudColumns(values, usedRows, usedCols, out _, out _, out _, out _))
                     return;
@@ -320,6 +434,7 @@ public static class SkudExcelInteropFiller
         ProcessingProtocol protocol)
     {
         dynamic sheet = FindTimesheetWorksheet(workbook, month, protocol, out TimesheetStructure structure);
+        EnsureTotalColumnFormatting(sheet, structure, protocol);
 
         if (skudMonths.Count > 1 && HasOnlyDayNumberDateHeaders(structure))
             throw new Exception("В СКУД найдены записи за несколько месяцев, а в табеле даты указаны только номерами дней. Укажите в табеле полные даты или используйте выгрузку СКУД за один месяц.");
@@ -337,6 +452,13 @@ public static class SkudExcelInteropFiller
         for (int i = 0; i < employees.Count; i++)
         {
             var employee = employees[i];
+            HashSet<int> invalidDeclaredColumns = MarkInvalidDeclaredShiftHours(
+                sheet,
+                structure,
+                employee,
+                month,
+                daysInMonth,
+                protocol);
             var search = FindPersonInSkudData(employee.OriginalName, eventsByPerson, personKeyIndex);
 
             protocol.Matching.Add($"{employee.OriginalName}; ключ={search.SearchKey}; статус={search.StatusText}; варианты={string.Join(", ", search.FoundVariants)}");
@@ -353,6 +475,9 @@ public static class SkudExcelInteropFiller
                     if (date.Month != month.Month || date.Year != month.Year || date.Day > daysInMonth)
                         continue;
 
+                    if (invalidDeclaredColumns.Contains(col))
+                        continue;
+
                     if (!TryGetDeclaredShiftHours(structure, employee.RowIndex, col, out _))
                         continue;
 
@@ -363,8 +488,7 @@ public static class SkudExcelInteropFiller
                         "статус=Смена заявлена, сотрудник не найден в данных СКУД");
                 }
 
-                if (structure.TotalHoursCol.HasValue)
-                    RecalculateTotal(sheet, employee.RowIndex, structure, protocol);
+                FinalizeEmployeeTotal(sheet, employee.RowIndex, structure, invalidDeclaredColumns, protocol);
 
                 continue;
             }
@@ -373,6 +497,9 @@ public static class SkudExcelInteropFiller
             {
                 result.AmbiguousEmployees++;
                 HighlightCellAmbiguous(sheet.Cells[employee.RowIndex, structure.FioCol], search.SearchKey, search.FoundVariants);
+
+                FinalizeEmployeeTotal(sheet, employee.RowIndex, structure, invalidDeclaredColumns, protocol);
+
                 continue;
             }
 
@@ -389,6 +516,9 @@ public static class SkudExcelInteropFiller
 
                 // Обрабатываем только даты, на которые в исходном табеле была заявлена смена.
                 // Пустые и незапланированные даты не заполняем, не комментируем и не выделяем.
+                if (invalidDeclaredColumns.Contains(col))
+                    continue;
+
                 if (!TryGetDeclaredShiftHours(structure, employee.RowIndex, col, out double declaredHours))
                     continue;
 
@@ -424,6 +554,8 @@ public static class SkudExcelInteropFiller
                 if (calc.RequiresManualReview)
                 {
                     dynamic reviewCell = sheet.Cells[employee.RowIndex, col];
+                    invalidDeclaredColumns.Add(col);
+                    ClearCellContentsSafe(reviewCell);
                     try { reviewCell.Interior.Color = RGB(255, 199, 206); } catch { }
                     AddCommentSafe(reviewCell, calc.Status);
                     protocol.Filling.Add(
@@ -451,8 +583,7 @@ public static class SkudExcelInteropFiller
                     $"первое={FormatTime(calc.FirstEvent)}; последнее={FormatTime(calc.LastEvent)}; часы={calc.Hours}; статус={calc.Status}");
             }
 
-            if (structure.TotalHoursCol.HasValue)
-                RecalculateTotal(sheet, employee.RowIndex, structure, protocol);
+            FinalizeEmployeeTotal(sheet, employee.RowIndex, structure, invalidDeclaredColumns, protocol);
 
             int current = i + 1;
             if (current % 5 == 0 || current == employees.Count)
@@ -462,7 +593,13 @@ public static class SkudExcelInteropFiller
         return result;
     }
 
-    private static dynamic FindTimesheetWorksheet(dynamic workbook, DateTime month, ProcessingProtocol protocol, out TimesheetStructure structure)
+    private static dynamic FindTimesheetWorksheet(
+        dynamic workbook,
+        DateTime month,
+        ProcessingProtocol protocol,
+        out TimesheetStructure structure,
+        int? maxRows = null,
+        int? maxColumns = null)
     {
         int sheetsCount = workbook.Worksheets.Count;
         Exception? lastStructureError = null;
@@ -474,10 +611,10 @@ public static class SkudExcelInteropFiller
 
             try
             {
-                usedRange = sheet.UsedRange;
-                object[,] values = ToArray2D(usedRange.Value2);
-                int usedRows = usedRange.Rows.Count;
-                int usedCols = usedRange.Columns.Count;
+                ExcelWorksheetData data = ExcelWorksheetReader.Read(sheet, maxRows, maxColumns);
+                object[,] values = data.Values;
+                int usedRows = data.Rows;
+                int usedCols = data.Columns;
 
                 if (TryDetectTimesheetStructure(values, usedRows, usedCols, month, protocol, out structure))
                     return sheet;
@@ -574,10 +711,10 @@ public static class SkudExcelInteropFiller
 
             try
             {
-                usedRange = sheet.UsedRange;
-                object[,] values = ToArray2D(usedRange.Value2);
-                int usedRows = usedRange.Rows.Count;
-                int usedCols = usedRange.Columns.Count;
+                ExcelWorksheetData data = ExcelWorksheetReader.Read(sheet);
+                object[,] values = data.Values;
+                int usedRows = data.Rows;
+                int usedCols = data.Columns;
 
                 if (!TryFindSkudColumns(values, usedRows, usedCols, out int headerRow, out int dateCol, out int personCol, out int messageCol))
                     continue;
@@ -1003,27 +1140,104 @@ public static class SkudExcelInteropFiller
         for (int col = 1; col <= usedCols; col++)
         {
             string header = NormalizeHeader(GetValueText(values[row, col]));
-            if (header == "итого часов")
+            if (header.Contains("итог") || header.Contains("всего"))
                 return col;
         }
 
         return null;
     }
 
-    private static int? FindTotalColumnAfterLastMonthDate(Dictionary<DateTime, int> dateColumns, DateTime month)
+    private static int? FindTotalColumnAfterLastMonthDate(
+        Dictionary<DateTime, int> dateColumns,
+        DateTime month)
     {
         var monthDateColumns = dateColumns
             .Where(x => x.Key.Year == month.Year && x.Key.Month == month.Month)
             .Select(x => x.Value)
             .ToList();
 
-        return monthDateColumns.Count == 0 ? null : monthDateColumns.Max() + 1;
+        if (monthDateColumns.Count == 0)
+            return null;
+
+        return monthDateColumns.Max() + 1;
+    }
+
+    private static HashSet<int> MarkInvalidDeclaredShiftHours(
+        dynamic sheet,
+        TimesheetStructure structure,
+        TimesheetEmployee employee,
+        DateTime month,
+        int daysInMonth,
+        ProcessingProtocol protocol)
+    {
+        var invalidColumns = new HashSet<int>();
+
+        foreach (var dateColumn in structure.DateColumns.OrderBy(x => x.Key))
+        {
+            DateTime date = dateColumn.Key.Date;
+            int col = dateColumn.Value;
+
+            if (date.Month != month.Month || date.Year != month.Year || date.Day > daysInMonth)
+                continue;
+
+            if (!TryGetDeclaredShiftHours(structure, employee.RowIndex, col, out double declaredHours)
+                || declaredHours <= MaxDeclaredShiftHours)
+                continue;
+
+            invalidColumns.Add(col);
+            dynamic cell = sheet.Cells[employee.RowIndex, col];
+            ClearCellContentsSafe(cell);
+            try { cell.Interior.Color = RGB(255, 199, 206); } catch { }
+
+            string message =
+                $"Заявленная смена {FormatHours(declaredHours)} ч превышает допустимый максимум " +
+                $"{FormatHours(MaxDeclaredShiftHours)} ч. Требуется ручная проверка.";
+            AddCommentSafe(cell, message);
+            protocol.Filling.Add(
+                $"{employee.OriginalName}; {date:dd.MM.yyyy}; заявлено={FormatHours(declaredHours)}; часы=; " +
+                $"статус=Превышен максимум заявленной смены {FormatHours(MaxDeclaredShiftHours)} ч — ручная проверка");
+        }
+
+        return invalidColumns;
+    }
+
+    private static void FinalizeEmployeeTotal(
+        dynamic sheet,
+        int row,
+        TimesheetStructure structure,
+        HashSet<int> invalidDeclaredColumns,
+        ProcessingProtocol protocol)
+    {
+        if (!structure.TotalHoursCol.HasValue)
+            return;
+
+        if (invalidDeclaredColumns.Count == 0)
+        {
+            RecalculateTotal(sheet, row, structure, protocol);
+            return;
+        }
+
+        dynamic totalCell = sheet.Cells[row, structure.TotalHoursCol.Value];
+        ClearCellContentsSafe(totalCell);
+        try { totalCell.Interior.Color = RGB(255, 199, 206); } catch { }
+        AddCommentSafe(
+            totalCell,
+            $"Итог не рассчитан: найдены смены больше {FormatHours(MaxDeclaredShiftHours)} ч. Требуется ручная проверка.");
+        protocol.Errors.Add(
+            $"Табель; строка {row}; итог не рассчитан; найдены смены больше {FormatHours(MaxDeclaredShiftHours)} ч");
     }
 
     private static void RecalculateTotal(dynamic sheet, int row, TimesheetStructure structure, ProcessingProtocol protocol)
     {
         try
         {
+            int totalColumn = structure.TotalHoursCol!.Value;
+            if (structure.DateColumns.Values.Contains(totalColumn))
+            {
+                protocol.Errors.Add($"Табель; строка {row}; итоговая колонка совпала с дневной колонкой; пересчёт итога пропущен");
+                return;
+            }
+
             double total = 0;
 
             foreach (int col in structure.DateColumns.Values.Distinct())
@@ -1033,7 +1247,7 @@ public static class SkudExcelInteropFiller
                     total += hours;
             }
 
-            dynamic totalCell = sheet.Cells[row, structure.TotalHoursCol!.Value];
+            dynamic totalCell = sheet.Cells[row, totalColumn];
 
             try
             {
@@ -1051,6 +1265,89 @@ public static class SkudExcelInteropFiller
         catch (Exception ex)
         {
             protocol.Errors.Add($"Табель; строка {row}; не удалось пересчитать итоговую колонку; {ex.Message}");
+        }
+    }
+
+    private static void EnsureTotalColumnFormatting(
+        dynamic sheet,
+        TimesheetStructure structure,
+        ProcessingProtocol protocol)
+    {
+        if (!structure.TotalHoursCol.HasValue || structure.DateColumns.Count == 0)
+            return;
+
+        int totalColumn = structure.TotalHoursCol.Value;
+        int lastDayColumn = structure.DateColumns.Values.Max();
+
+        if (structure.DateColumns.Values.Contains(totalColumn))
+            return;
+
+        try
+        {
+            int headerRow = structure.DateRow > 0 ? structure.DateRow : structure.HeaderRow;
+            dynamic sourceHeader = sheet.Cells[headerRow, lastDayColumn];
+            dynamic totalHeader = sheet.Cells[headerRow, totalColumn];
+
+            try
+            {
+                sourceHeader.Copy();
+                totalHeader.PasteSpecial(-4122); // xlPasteFormats
+            }
+            catch { }
+
+            if (string.IsNullOrWhiteSpace(GetValueText(totalHeader.Value2)))
+                totalHeader.Value2 = "Итого часов";
+
+            try { totalHeader.Font.Bold = true; } catch { }
+            try { totalHeader.HorizontalAlignment = -4108; } catch { } // xlCenter
+            try { totalHeader.VerticalAlignment = -4108; } catch { }
+            try { totalHeader.WrapText = true; } catch { }
+
+            for (int row = structure.FirstEmployeeRow; row <= structure.UsedRows; row++)
+            {
+                dynamic sourceCell = sheet.Cells[row, lastDayColumn];
+                dynamic totalCell = sheet.Cells[row, totalColumn];
+
+                try
+                {
+                    sourceCell.Copy();
+                    totalCell.PasteSpecial(-4122); // xlPasteFormats
+                }
+                catch { }
+
+                try { totalCell.Interior.Pattern = -4142; } catch { } // xlNone
+                try { totalCell.NumberFormat = "0"; } catch { }
+                try { totalCell.HorizontalAlignment = -4108; } catch { }
+                try { totalCell.VerticalAlignment = -4108; } catch { }
+            }
+
+            for (int row = headerRow; row <= structure.UsedRows; row++)
+            {
+                dynamic lastDayCell = sheet.Cells[row, lastDayColumn];
+                dynamic totalCell = sheet.Cells[row, totalColumn];
+
+                try { lastDayCell.Borders[10].LineStyle = 1; } catch { } // xlEdgeRight, xlContinuous
+                try { lastDayCell.Borders[10].Weight = 2; } catch { } // xlThin
+                try { totalCell.Borders[7].LineStyle = 1; } catch { } // xlEdgeLeft
+                try { totalCell.Borders[7].Weight = 2; } catch { }
+                try { totalCell.Borders[10].LineStyle = 1; } catch { }
+                try { totalCell.Borders[10].Weight = -4138; } catch { } // xlMedium
+            }
+
+            try
+            {
+                double lastDayWidth = Convert.ToDouble(
+                    sheet.Columns[lastDayColumn].ColumnWidth,
+                    CultureInfo.InvariantCulture);
+                sheet.Columns[totalColumn].ColumnWidth = Math.Max(7d, lastDayWidth);
+            }
+            catch { }
+
+            try { sheet.Application.CutCopyMode = false; } catch { }
+        }
+        catch (Exception ex)
+        {
+            protocol.Errors.Add($"Табель; не удалось оформить итоговую колонку; {ex.Message}");
         }
     }
 
@@ -1441,6 +1738,15 @@ public static class SkudExcelInteropFiller
 
             int wholeHours = (int)Math.Floor(duration.TotalHours);
             int roundedHours = duration.Minutes >= 50 ? wholeHours + 1 : wholeHours;
+
+            if (roundedHours > MaxDeclaredShiftHours)
+            {
+                result.RequiresManualReview = true;
+                result.Status =
+                    $"По отметкам СКУД рассчитано {roundedHours} ч, что превышает допустимый максимум " +
+                    $"{FormatHours(MaxDeclaredShiftHours)} ч. Требуется ручная проверка.";
+                return result;
+            }
 
             result.Hours = roundedHours;
             result.ShouldWriteValue = true;

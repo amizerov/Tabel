@@ -43,8 +43,9 @@ public static class SkudTimesheetComparator
         var protocol = new List<string>();
         dynamic? excel = null;
         dynamic? originalBook = null;
-        dynamic? filledBook = null;
         dynamic? outputBook = null;
+        dynamic? originalSheet = null;
+        dynamic? filledSheet = null;
 
         try
         {
@@ -70,34 +71,25 @@ public static class SkudTimesheetComparator
             Report("Чтение табелей", "Читаю исходный и заполненный табели...", 0, 100, 15);
 
             originalBook = excel.Workbooks.Open(originalPath);
-            dynamic originalSheet = FindWorksheetWithTimesheet(originalBook, out TimesheetStructure originalStructure);
-            dynamic originalUsedRange = originalSheet.UsedRange;
-            object[,] originalValues = ToArray2D(originalUsedRange.Value2);
-            int originalRows = originalUsedRange.Rows.Count;
-            int originalCols = originalUsedRange.Columns.Count;
-            ReleaseComObject(originalUsedRange);
-            originalStructure = originalStructure with { Values = originalValues, UsedRows = originalRows, UsedCols = originalCols };
+            originalSheet = FindWorksheetWithTimesheet(originalBook, out TimesheetStructure originalStructure);
+            object[,] originalValues = originalStructure.Values;
+            int originalRows = originalStructure.UsedRows;
+            int originalCols = originalStructure.UsedCols;
 
-            filledBook = excel.Workbooks.Open(filledPath);
-            dynamic filledSheet = FindWorksheetWithTimesheet(filledBook, out TimesheetStructure filledStructure);
-            dynamic filledUsedRange = filledSheet.UsedRange;
-            object[,] filledValues = ToArray2D(filledUsedRange.Value2);
-            int filledRows = filledUsedRange.Rows.Count;
-            int filledCols = filledUsedRange.Columns.Count;
-            ReleaseComObject(filledUsedRange);
-            filledStructure = filledStructure with { Values = filledValues, UsedRows = filledRows, UsedCols = filledCols };
-
-            AlignDateColumns(ref originalStructure, ref filledStructure);
-
+            ReleaseComObject(originalSheet);
+            originalSheet = null;
             originalBook.Close(false);
-            filledBook.Close(false);
             ReleaseComObject(originalBook);
-            ReleaseComObject(filledBook);
             originalBook = null;
-            filledBook = null;
 
             outputBook = excel.Workbooks.Open(outputPath);
-            dynamic outputSheet = FindWorksheetWithTimesheet(outputBook, out TimesheetStructure _);
+            filledSheet = FindWorksheetWithTimesheet(outputBook, out TimesheetStructure filledStructure);
+            object[,] filledValues = filledStructure.Values;
+            int filledRows = filledStructure.UsedRows;
+            int filledCols = filledStructure.UsedCols;
+
+            AlignDateColumns(ref originalStructure, ref filledStructure);
+            EnsureTotalColumnFormatting(filledSheet, filledStructure, protocol);
 
             Report("Сравнение табелей", "Сравниваю дневные часы...", 0, 100, 40);
 
@@ -110,12 +102,14 @@ public static class SkudTimesheetComparator
                 filledCols,
                 originalStructure,
                 filledStructure,
-                outputSheet,
+                filledSheet,
                 protocol);
 
             Report("Сохранение", "Сохраняю файл сравнения...", 0, 100, 95);
             TabelWorkbookMetadata.SetRole(outputBook, TabelWorkbookMetadata.ComparisonRole);
             outputBook.Save();
+            ReleaseComObject(filledSheet);
+            filledSheet = null;
             outputBook.Close(false);
             ReleaseComObject(outputBook);
             outputBook = null;
@@ -140,18 +134,19 @@ public static class SkudTimesheetComparator
         }
         finally
         {
+            if (filledSheet != null)
+                ReleaseComObject(filledSheet);
+            if (originalSheet != null)
+                ReleaseComObject(originalSheet);
+
             try { if (outputBook != null) outputBook.Close(false); } catch { }
             try { if (originalBook != null) originalBook.Close(false); } catch { }
-            try { if (filledBook != null) filledBook.Close(false); } catch { }
 
             if (outputBook != null)
                 ReleaseComObject(outputBook);
 
             if (originalBook != null)
                 ReleaseComObject(originalBook);
-
-            if (filledBook != null)
-                ReleaseComObject(filledBook);
 
             if (excel != null)
             {
@@ -230,6 +225,15 @@ public static class SkudTimesheetComparator
                 protocol.Add($"{originalEmployee.OriginalName};;;;;;{FlattenForProtocol(fioComment)}");
                 stats.SpecialStatuses++;
                 currentComparison += originalStructure.DayColumns.Count;
+
+                RecalculateOutputTotal(
+                    outputSheet,
+                    filledEmployee.RowIndex,
+                    filledStructure,
+                    originalEmployee.OriginalName,
+                    protocol,
+                    stats);
+
                 continue;
             }
 
@@ -409,6 +413,25 @@ public static class SkudTimesheetComparator
 
         try
         {
+            int totalColumn = structure.TotalHoursCol.Value;
+            if (structure.DayColumns.Values.Contains(totalColumn))
+            {
+                stats.ReadErrors++;
+                protocol.Add($"{fio};;;;;;Итоговая колонка совпала с дневной колонкой. Пересчёт итога пропущен");
+                return;
+            }
+
+            dynamic totalCell = sheet.Cells[row, totalColumn];
+            string totalComment = GetCellCommentText(totalCell);
+            if (totalComment.Contains("Итог не рассчитан", StringComparison.OrdinalIgnoreCase))
+            {
+                try { totalCell.ClearContents(); } catch { try { totalCell.Value2 = null; } catch { } }
+                try { HighlightCellRed(totalCell); } catch { }
+                protocol.Add($"{fio};;;;;;{FlattenForProtocol(totalComment)}");
+                stats.SpecialStatuses++;
+                return;
+            }
+
             double total = 0;
             foreach (int col in structure.DayColumns.Values.Distinct())
             {
@@ -417,7 +440,6 @@ public static class SkudTimesheetComparator
                     total += hours;
             }
 
-            dynamic totalCell = sheet.Cells[row, structure.TotalHoursCol.Value];
             try
             {
                 if (totalCell.HasFormula == true)
@@ -437,6 +459,97 @@ public static class SkudTimesheetComparator
         }
     }
 
+    private static void EnsureTotalColumnFormatting(
+        dynamic sheet,
+        TimesheetStructure structure,
+        List<string> protocol)
+    {
+        if (!structure.TotalHoursCol.HasValue || structure.DayColumns.Count == 0)
+            return;
+
+        int totalColumn = structure.TotalHoursCol.Value;
+        int lastDayColumn = structure.DayColumns.Values.Max();
+
+        if (structure.DayColumns.Values.Contains(totalColumn))
+            return;
+
+        try
+        {
+            int headerRow = structure.DateRow > 0 ? structure.DateRow : structure.HeaderRow;
+            dynamic sourceHeader = sheet.Cells[headerRow, lastDayColumn];
+            dynamic totalHeader = sheet.Cells[headerRow, totalColumn];
+
+            try
+            {
+                sourceHeader.Copy();
+                totalHeader.PasteSpecial(-4122); // xlPasteFormats
+            }
+            catch { }
+
+            if (string.IsNullOrWhiteSpace(GetValueText(totalHeader.Value2)))
+                totalHeader.Value2 = "Итого часов";
+
+            try { totalHeader.Font.Bold = true; } catch { }
+            try { totalHeader.HorizontalAlignment = -4108; } catch { } // xlCenter
+            try { totalHeader.VerticalAlignment = -4108; } catch { }
+            try { totalHeader.WrapText = true; } catch { }
+
+            for (int row = structure.FirstEmployeeRow; row <= structure.UsedRows; row++)
+            {
+                dynamic sourceCell = sheet.Cells[row, lastDayColumn];
+                dynamic totalCell = sheet.Cells[row, totalColumn];
+
+                try
+                {
+                    sourceCell.Copy();
+                    totalCell.PasteSpecial(-4122); // xlPasteFormats
+                }
+                catch { }
+
+                string totalComment = GetCellCommentText(totalCell);
+                if (totalComment.Contains("Итог не рассчитан", StringComparison.OrdinalIgnoreCase))
+                {
+                    try { HighlightCellRed(totalCell); } catch { }
+                }
+                else
+                {
+                    try { totalCell.Interior.Pattern = -4142; } catch { } // xlNone
+                }
+                try { totalCell.NumberFormat = "0"; } catch { }
+                try { totalCell.HorizontalAlignment = -4108; } catch { }
+                try { totalCell.VerticalAlignment = -4108; } catch { }
+            }
+
+            for (int row = headerRow; row <= structure.UsedRows; row++)
+            {
+                dynamic lastDayCell = sheet.Cells[row, lastDayColumn];
+                dynamic totalCell = sheet.Cells[row, totalColumn];
+
+                try { lastDayCell.Borders[10].LineStyle = 1; } catch { } // xlEdgeRight, xlContinuous
+                try { lastDayCell.Borders[10].Weight = 2; } catch { } // xlThin
+                try { totalCell.Borders[7].LineStyle = 1; } catch { } // xlEdgeLeft
+                try { totalCell.Borders[7].Weight = 2; } catch { }
+                try { totalCell.Borders[10].LineStyle = 1; } catch { }
+                try { totalCell.Borders[10].Weight = -4138; } catch { } // xlMedium
+            }
+
+            try
+            {
+                double lastDayWidth = Convert.ToDouble(
+                    sheet.Columns[lastDayColumn].ColumnWidth,
+                    CultureInfo.InvariantCulture);
+                sheet.Columns[totalColumn].ColumnWidth = Math.Max(7d, lastDayWidth);
+            }
+            catch { }
+
+            try { sheet.Application.CutCopyMode = false; } catch { }
+        }
+        catch (Exception ex)
+        {
+            protocol.Add($";;;;;;Не удалось оформить итоговую колонку: {FlattenForProtocol(ex.Message)}");
+        }
+    }
+
     private static dynamic FindWorksheetWithTimesheet(dynamic workbook, out TimesheetStructure structure)
     {
         int sheetsCount = workbook.Worksheets.Count;
@@ -449,10 +562,10 @@ public static class SkudTimesheetComparator
 
             try
             {
-                usedRange = sheet.UsedRange;
-                object[,] values = ToArray2D(usedRange.Value2);
-                int usedRows = usedRange.Rows.Count;
-                int usedCols = usedRange.Columns.Count;
+                ExcelWorksheetData data = ExcelWorksheetReader.Read(sheet);
+                object[,] values = data.Values;
+                int usedRows = data.Rows;
+                int usedCols = data.Columns;
 
                 if (TryDetectTimesheetStructure(values, usedRows, usedCols, out structure))
                     return sheet;
@@ -500,7 +613,7 @@ public static class SkudTimesheetComparator
             Math.Max(headerRow, dateRow) + 1,
             fioCol,
             dayColumns,
-            FindTotalColumn(values, Math.Max(headerRow, dateRow), usedCols),
+            FindTotalColumn(values, Math.Max(headerRow, dateRow), usedCols, dayColumns),
             values,
             usedRows,
             usedCols,
@@ -585,19 +698,27 @@ public static class SkudTimesheetComparator
         return null;
     }
 
-    private static int? FindTotalColumn(object[,] values, int row, int usedCols)
+    private static int? FindTotalColumn(
+        object[,] values,
+        int row,
+        int usedCols,
+        Dictionary<DateTime, int> dayColumns)
     {
         if (row > 0)
         {
             for (int col = 1; col <= usedCols; col++)
             {
                 string header = NormalizeHeader(GetValueText(values[row, col]));
-                if (header.Contains("итог"))
+                if ((header.Contains("итог") || header.Contains("всего"))
+                    && !dayColumns.Values.Contains(col))
                     return col;
             }
         }
 
-        return usedCols >= 32 ? 32 : null;
+        if (dayColumns.Count == 0)
+            return null;
+
+        return dayColumns.Values.Max() + 1;
     }
 
     private static List<TimesheetEmployee> ReadEmployees(TimesheetStructure structure)
