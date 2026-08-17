@@ -781,10 +781,15 @@ public static class SkudTimesheetComparator
         if (filledIndex.ByFullName.TryGetValue(originalEmployee.NormalizedName, out var fullMatches))
             return BuildRowMatch(fullMatches);
 
+        List<TimesheetEmployee>? safeShortMatches = null;
+
         if (!string.IsNullOrWhiteSpace(originalEmployee.ShortKey)
             && filledIndex.ByShortKey.TryGetValue(originalEmployee.ShortKey, out var shortMatches))
         {
-            RowMatch shortMatch = BuildRowMatch(shortMatches);
+            safeShortMatches = shortMatches
+                .Where(candidate => IsSafeShortKeyMatch(originalEmployee.NormalizedName, candidate.NormalizedName))
+                .ToList();
+            RowMatch shortMatch = BuildRowMatch(safeShortMatches);
             if (shortMatch.Status == MatchStatus.Found)
                 return shortMatch;
         }
@@ -800,11 +805,27 @@ public static class SkudTimesheetComparator
         if (fuzzy.Status == FuzzyMatchStatus.Ambiguous)
             return RowMatch.Ambiguous(fuzzy.Candidates.ToList());
 
-        if (!string.IsNullOrWhiteSpace(originalEmployee.ShortKey)
-            && filledIndex.ByShortKey.TryGetValue(originalEmployee.ShortKey, out shortMatches))
-            return BuildRowMatch(shortMatches);
+        if (safeShortMatches is { Count: > 0 })
+            return BuildRowMatch(safeShortMatches);
 
         return RowMatch.NotFound();
+    }
+
+    private static bool IsSafeShortKeyMatch(string sourceName, string candidateName)
+    {
+        var sourceParts = NormalizeName(sourceName).Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        var candidateParts = NormalizeName(candidateName).Split(' ', StringSplitOptions.RemoveEmptyEntries);
+
+        if (sourceParts.Length < 2 || candidateParts.Length < 2)
+            return true;
+
+        if (!string.Equals(sourceParts[0], candidateParts[0], StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        if (sourceParts[1].Length > 1 && candidateParts[1].Length > 1)
+            return string.Equals(sourceParts[1], candidateParts[1], StringComparison.OrdinalIgnoreCase);
+
+        return sourceParts[1][0] == candidateParts[1][0];
     }
 
     private static RowMatch BuildRowMatch(List<TimesheetEmployee> matches)

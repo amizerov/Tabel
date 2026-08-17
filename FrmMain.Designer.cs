@@ -28,7 +28,7 @@ namespace Tabel
             btnSelectSkud = new Button();
             btnProcessTimesheet = new Button();
             lblFillResultCaption = new Label();
-            lblFillResultPath = new Label();
+            lblFillResultPath = new LinkLabel();
             btnGoToCompare = new Button();
             btnFillHelp = new Button();
             grpCompareStep = new GroupBox();
@@ -43,7 +43,7 @@ namespace Tabel
             btnSelectCompareFilled = new Button();
             btnCompareTimesheets = new Button();
             lblCompareResultCaption = new Label();
-            lblCompareResultPath = new Label();
+            lblCompareResultPath = new LinkLabel();
             btnBackToFill = new Button();
             btnCompareHelp = new Button();
             grpProgress = new GroupBox();
@@ -215,6 +215,7 @@ namespace Tabel
             lblFillResultPath.Name = "lblFillResultPath";
             lblFillResultPath.Size = new Size(620, 23);
             lblFillResultPath.TabIndex = 8;
+            lblFillResultPath.LinkClicked += lblFillResultPath_LinkClicked;
             // 
             // btnGoToCompare
             // 
@@ -394,6 +395,7 @@ namespace Tabel
             lblCompareResultPath.Name = "lblCompareResultPath";
             lblCompareResultPath.Size = new Size(620, 23);
             lblCompareResultPath.TabIndex = 8;
+            lblCompareResultPath.LinkClicked += lblCompareResultPath_LinkClicked;
             // 
             // btnBackToFill
             // 
@@ -514,7 +516,7 @@ namespace Tabel
         private Button btnSelectSkud;
         private Button btnProcessTimesheet;
         private Label lblFillResultCaption;
-        private Label lblFillResultPath;
+        private LinkLabel lblFillResultPath;
         private Button btnGoToCompare;
         private Button btnFillHelp;
         private Label lblCompareOriginal;
@@ -525,7 +527,7 @@ namespace Tabel
         private Button btnSelectCompareFilled;
         private Button btnCompareTimesheets;
         private Label lblCompareResultCaption;
-        private Label lblCompareResultPath;
+        private LinkLabel lblCompareResultPath;
         private Button btnBackToFill;
         private Button btnCompareHelp;
         private GroupBox grpProgress;

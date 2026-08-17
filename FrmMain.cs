@@ -1,5 +1,6 @@
 namespace Tabel;
 
+using System.Diagnostics;
 using System.Reflection;
 
 public partial class FrmMain : Form
@@ -17,6 +18,8 @@ public partial class FrmMain : Form
     private string? _compareFilledPath;
     private string? _lastFillerSummary;
     private string? _lastComparatorSummary;
+    private string? _completedFillResultPath;
+    private string? _completedCompareResultPath;
     private HelpForm? _helpForm;
     private bool _isBusy;
 
@@ -81,6 +84,7 @@ public partial class FrmMain : Form
         if (path == null) return;
 
         _fillTimesheetPath = null;
+        _completedFillResultPath = null;
         txtFillTimesheet.Clear();
         UpdateFillResultPreview();
         UpdateActionState();
@@ -100,7 +104,9 @@ public partial class FrmMain : Form
         if (path == null) return;
 
         _skudPath = null;
+        _completedFillResultPath = null;
         txtSkud.Clear();
+        UpdateFillResultPreview();
         UpdateActionState();
 
         if (PathsAreEqual(path, _fillTimesheetPath))
@@ -123,6 +129,7 @@ public partial class FrmMain : Form
         if (path == null) return;
 
         _compareOriginalPath = null;
+        _completedCompareResultPath = null;
         txtCompareOriginal.Clear();
         UpdateCompareResultPreview();
         UpdateActionState();
@@ -148,6 +155,7 @@ public partial class FrmMain : Form
         if (path == null) return;
 
         _compareFilledPath = null;
+        _completedCompareResultPath = null;
         txtCompareFilled.Clear();
         UpdateCompareResultPreview();
         UpdateActionState();
@@ -238,6 +246,8 @@ public partial class FrmMain : Form
         string timesheetPath = _fillTimesheetPath;
         string skudPath = _skudPath;
         SetBusy(true);
+        _completedFillResultPath = null;
+        UpdateFillResultPreview();
         _lastFillerSummary = null;
         BeginOperation("Начинаю заполнение табеля по СКУД.");
         AddLog("Табель: " + timesheetPath);
@@ -246,6 +256,8 @@ public partial class FrmMain : Form
         try
         {
             string result = await SkudExcelInteropFiller.FillTimesheetAsync(timesheetPath, skudPath);
+            _completedFillResultPath = result;
+            UpdateFillResultPreview();
             PrepareComparison(timesheetPath, result);
             ShowSuccess(
                 result,
@@ -274,6 +286,8 @@ public partial class FrmMain : Form
         string originalPath = _compareOriginalPath;
         string filledPath = _compareFilledPath;
         SetBusy(true);
+        _completedCompareResultPath = null;
+        UpdateCompareResultPreview();
         _lastComparatorSummary = null;
         BeginOperation("Начинаю сравнение табелей.");
         AddLog("Исходный табель: " + originalPath);
@@ -282,6 +296,8 @@ public partial class FrmMain : Form
         try
         {
             string result = await SkudTimesheetComparator.CompareTimesheetsAsync(originalPath, filledPath);
+            _completedCompareResultPath = result;
+            UpdateCompareResultPreview();
             ShowSuccess(
                 result,
                 _lastComparatorSummary ?? "Сравнение табелей завершено.",
@@ -353,14 +369,16 @@ public partial class FrmMain : Form
 
     private void UpdateFillResultPreview()
     {
-        lblFillResultPath.Text = BuildResultPath(_fillTimesheetPath, "_заполнен.xlsx")
+        string preview = BuildResultPath(_fillTimesheetPath, "_заполнен.xlsx")
             ?? "Будет показан после выбора исходного табеля.";
+        UpdateResultLink(lblFillResultPath, preview, _completedFillResultPath);
     }
 
     private void PrepareComparison(string originalPath, string filledPath)
     {
         _compareOriginalPath = originalPath;
         _compareFilledPath = filledPath;
+        _completedCompareResultPath = null;
         txtCompareOriginal.Text = originalPath;
         txtCompareFilled.Text = filledPath;
 
@@ -398,14 +416,74 @@ public partial class FrmMain : Form
     {
         if (PathsAreEqual(_compareOriginalPath, _compareFilledPath))
         {
-            lblCompareResultPath.ForeColor = Color.Firebrick;
-            lblCompareResultPath.Text = "Исходный и заполненный табели должны быть разными файлами.";
+            UpdateResultLink(
+                lblCompareResultPath,
+                "Исходный и заполненный табели должны быть разными файлами.",
+                null,
+                Color.Firebrick);
             return;
         }
 
-        lblCompareResultPath.ForeColor = SystemColors.GrayText;
-        lblCompareResultPath.Text = BuildResultPath(_compareOriginalPath, "_сравнение.xlsx")
+        string preview = BuildResultPath(_compareOriginalPath, "_сравнение.xlsx")
             ?? "Будет показан после выбора исходного табеля.";
+        UpdateResultLink(lblCompareResultPath, preview, _completedCompareResultPath);
+    }
+
+    private static void UpdateResultLink(
+        LinkLabel label,
+        string preview,
+        string? completedPath,
+        Color? previewColor = null)
+    {
+        label.Links.Clear();
+        label.Text = completedPath ?? preview;
+
+        if (!string.IsNullOrWhiteSpace(completedPath))
+        {
+            label.Enabled = true;
+            label.Cursor = Cursors.Hand;
+            label.LinkColor = Color.FromArgb(0, 102, 204);
+            label.ActiveLinkColor = Color.FromArgb(204, 51, 0);
+            label.VisitedLinkColor = label.LinkColor;
+            label.Links.Add(0, label.Text.Length, completedPath);
+            return;
+        }
+
+        label.Enabled = false;
+        label.Cursor = Cursors.Default;
+        label.ForeColor = previewColor ?? SystemColors.GrayText;
+    }
+
+    private void lblFillResultPath_LinkClicked(object sender, LinkLabelLinkClickedEventArgs e) =>
+        OpenResultFile(_completedFillResultPath);
+
+    private void lblCompareResultPath_LinkClicked(object sender, LinkLabelLinkClickedEventArgs e) =>
+        OpenResultFile(_completedCompareResultPath);
+
+    private void OpenResultFile(string? path)
+    {
+        if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
+        {
+            MessageBox.Show(
+                "Файл результата не найден. Возможно, он был перемещён или удалён.",
+                "Файл не найден",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Warning);
+            return;
+        }
+
+        try
+        {
+            Process.Start(new ProcessStartInfo(path) { UseShellExecute = true });
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(
+                $"Не удалось открыть файл через Windows.{Environment.NewLine}{Environment.NewLine}{ex.Message}",
+                "Ошибка открытия",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Error);
+        }
     }
 
     private static string? BuildResultPath(string? sourcePath, string suffix)

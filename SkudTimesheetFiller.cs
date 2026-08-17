@@ -77,12 +77,14 @@ public static class SkudExcelInteropFiller
         if (!string.Equals(Path.GetExtension(path), ".xlsx", StringComparison.OrdinalIgnoreCase))
             throw new Exception("Поддерживаются только Excel-файлы формата .xlsx.");
 
+        dynamic? workbooks = null;
         dynamic? workbook = null;
         dynamic? timesheetSheet = null;
 
         try
         {
-            workbook = excel.Workbooks.Open(path, 0, true);
+            workbooks = excel.Workbooks;
+            workbook = workbooks.Open(path, 0, true);
 
             if (expectation == InputFileExpectation.SkudExport)
             {
@@ -118,7 +120,8 @@ public static class SkudExcelInteropFiller
             try { if (workbook != null) workbook.Close(false); } catch { }
             if (workbook != null)
                 ReleaseComObject(workbook);
-
+            if (workbooks != null)
+                ReleaseComObject(workbooks);
         }
     }
 
@@ -184,39 +187,39 @@ public static class SkudExcelInteropFiller
 
         private void ProcessRequests()
         {
-            dynamic? excel = null;
-
-            try
+            foreach (Request request in _requests.GetConsumingEnumerable())
             {
-                foreach (Request request in _requests.GetConsumingEnumerable())
+                dynamic? excel = null;
+
+                try
                 {
-                    try
-                    {
-                        var file = new FileInfo(request.Path);
-                        var key = (Path.GetFullPath(request.Path), request.Expectation);
-                        var stamp = new CacheEntry(file.Length, file.LastWriteTimeUtc);
+                    var file = new FileInfo(request.Path);
+                    var key = (Path.GetFullPath(request.Path), request.Expectation);
+                    var stamp = new CacheEntry(file.Length, file.LastWriteTimeUtc);
 
-                        if (!_cache.TryGetValue(key, out CacheEntry? cached) || cached != stamp)
-                        {
-                            excel ??= CreateValidationExcel();
-                            ValidateInputFile(request.Path, request.Expectation, excel);
-                            _cache[key] = stamp;
-                        }
-
-                        request.Completion.TrySetResult(true);
-                    }
-                    catch (Exception ex)
+                    if (!_cache.TryGetValue(key, out CacheEntry? cached) || cached != stamp)
                     {
-                        request.Completion.TrySetException(ex);
+                        excel = CreateValidationExcel();
+                        ValidateInputFile(request.Path, request.Expectation, excel);
+                        _cache[key] = stamp;
                     }
+
+                    request.Completion.TrySetResult(true);
                 }
-            }
-            finally
-            {
-                if (excel != null)
+                catch (Exception ex)
                 {
-                    try { excel.Quit(); } catch { }
-                    ReleaseComObject(excel);
+                    request.Completion.TrySetException(ex);
+                }
+                finally
+                {
+                    if (excel != null)
+                    {
+                        try { excel.Quit(); } catch { }
+                        ReleaseComObject(excel);
+                    }
+
+                    GC.Collect();
+                    GC.WaitForPendingFinalizers();
                 }
             }
         }
@@ -884,21 +887,19 @@ public static class SkudExcelInteropFiller
 
         if (!string.IsNullOrWhiteSpace(searchKey) && personKeyIndex.TryGetValue(searchKey, out var keys))
         {
-            var uniqueKeys = keys.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
-            shortKeyCandidates = uniqueKeys;
+            shortKeyCandidates = keys
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .Where(candidate => IsSafeShortKeyMatch(fioFromTimesheet, candidate))
+                .ToList();
 
-            if (uniqueKeys.Count == 1)
+            if (shortKeyCandidates.Count == 1)
             {
-                string candidate = uniqueKeys[0];
-
-                if (IsSafeShortKeyMatch(fioFromTimesheet, candidate))
-                {
-                    result.Status = PersonSearchResult.Found;
-                    result.PersonKey = candidate;
-                    result.StatusText = "найден по краткому ключу";
-                    result.FoundVariants.Add(candidate);
-                    return result;
-                }
+                string candidate = shortKeyCandidates[0];
+                result.Status = PersonSearchResult.Found;
+                result.PersonKey = candidate;
+                result.StatusText = "найден по краткому ключу";
+                result.FoundVariants.Add(candidate);
+                return result;
             }
         }
 
@@ -925,7 +926,7 @@ public static class SkudExcelInteropFiller
             return result;
         }
 
-        if (shortKeyCandidates != null)
+        if (shortKeyCandidates is { Count: > 0 })
         {
             result.Status = PersonSearchResult.AmbiguousFound;
             result.StatusText = shortKeyCandidates.Count == 1
