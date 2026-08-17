@@ -6,6 +6,8 @@ internal sealed record ExcelWorksheetData(object[,] Values, int Rows, int Column
 
 internal static class ExcelWorksheetReader
 {
+    private const int MaxRowsPerRead = 5000;
+    private const int MaxCellsPerRead = 100000;
     private const int XlFormulas = -4123;
     private const int XlPart = 2;
     private const int XlByRows = 1;
@@ -17,6 +19,9 @@ internal static class ExcelWorksheetReader
         dynamic? cells = null;
         dynamic? lastRowCell = null;
         dynamic? lastColumnCell = null;
+        dynamic? usedRange = null;
+        dynamic? usedRangeRows = null;
+        dynamic? usedRangeColumns = null;
         dynamic? firstCell = null;
         dynamic? endCell = null;
         dynamic? range = null;
@@ -34,17 +39,44 @@ internal static class ExcelWorksheetReader
             int rows = lastRowCell == null ? 1 : Convert.ToInt32(lastRowCell.Row);
             int columns = lastColumnCell == null ? 1 : Convert.ToInt32(lastColumnCell.Column);
 
+            // Find can occasionally return a stale boundary for filtered/imported sheets.
+            // UsedRange is kept as a fallback so records below that boundary are not lost.
+            usedRange = sheet.UsedRange;
+            int usedFirstRow = Convert.ToInt32(usedRange.Row);
+            int usedFirstColumn = Convert.ToInt32(usedRange.Column);
+            usedRangeRows = usedRange.Rows;
+            usedRangeColumns = usedRange.Columns;
+            int usedRowCount = Convert.ToInt32(usedRangeRows.Count);
+            int usedColumnCount = Convert.ToInt32(usedRangeColumns.Count);
+            rows = Math.Max(rows, usedFirstRow + usedRowCount - 1);
+            columns = Math.Max(columns, usedFirstColumn + usedColumnCount - 1);
+
             if (maxRows.HasValue)
                 rows = Math.Min(rows, maxRows.Value);
             if (maxColumns.HasValue)
                 columns = Math.Min(columns, maxColumns.Value);
 
-            firstCell = cells[1, 1];
-            endCell = cells[rows, columns];
-            range = sheet.Range[firstCell, endCell];
+            var values = new object[rows + 1, columns + 1];
+            int rowsPerRead = Math.Max(1, Math.Min(MaxRowsPerRead, MaxCellsPerRead / columns));
 
-            object value = range.Value2;
-            return new ExcelWorksheetData(ToArray2D(value), rows, columns);
+            for (int firstRow = 1; firstRow <= rows; firstRow += rowsPerRead)
+            {
+                int lastRow = Math.Min(rows, firstRow + rowsPerRead - 1);
+                firstCell = cells[firstRow, 1];
+                endCell = cells[lastRow, columns];
+                range = sheet.Range[firstCell, endCell];
+
+                CopyTo(values, range.Value2, firstRow, lastRow, columns);
+
+                ReleaseComObject(range);
+                range = null;
+                ReleaseComObject(endCell);
+                endCell = null;
+                ReleaseComObject(firstCell);
+                firstCell = null;
+            }
+
+            return new ExcelWorksheetData(values, rows, columns);
         }
         finally
         {
@@ -53,18 +85,33 @@ internal static class ExcelWorksheetReader
             ReleaseComObject(firstCell);
             ReleaseComObject(lastColumnCell);
             ReleaseComObject(lastRowCell);
+            ReleaseComObject(usedRangeColumns);
+            ReleaseComObject(usedRangeRows);
+            ReleaseComObject(usedRange);
             ReleaseComObject(cells);
         }
     }
 
-    private static object[,] ToArray2D(object value)
+    private static void CopyTo(object[,] destination, object value, int firstRow, int lastRow, int columns)
     {
-        if (value is object[,] array)
-            return array;
+        if (value is not object[,] source)
+        {
+            destination[firstRow, 1] = value;
+            return;
+        }
 
-        var result = new object[2, 2];
-        result[1, 1] = value;
-        return result;
+        int sourceFirstRow = source.GetLowerBound(0);
+        int sourceFirstColumn = source.GetLowerBound(1);
+        int rowCount = lastRow - firstRow + 1;
+
+        for (int rowOffset = 0; rowOffset < rowCount; rowOffset++)
+        {
+            for (int columnOffset = 0; columnOffset < columns; columnOffset++)
+            {
+                destination[firstRow + rowOffset, columnOffset + 1] =
+                    source[sourceFirstRow + rowOffset, sourceFirstColumn + columnOffset];
+            }
+        }
     }
 
     private static void ReleaseComObject(object? value)
